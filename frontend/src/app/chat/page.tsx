@@ -158,11 +158,12 @@ export default function ChatPage() {
 
       // Update relationship affinity in local state
       if (response.affinity_change !== undefined) {
+        const affChange = response.affinity_change;
         setRelationship((prev) => {
           if (!prev) return prev;
           const newScore = Math.max(
             -100,
-            Math.min(100, (prev.affinity_score || 0) + response.affinity_change)
+            Math.min(100, (prev.affinity_score || 0) + affChange)
           );
           return {
             ...prev,
@@ -171,10 +172,10 @@ export default function ChatPage() {
           };
         });
 
-        if (response.affinity_change > 0) {
-          success(`+${response.affinity_change} Affinity with ${selectedNpc.name}!`);
-        } else if (response.affinity_change < 0) {
-          info(`${response.affinity_change} Affinity with ${selectedNpc.name}`);
+        if (affChange > 0) {
+          success(`+${affChange} Affinity with ${selectedNpc.name}!`);
+        } else if (affChange < 0) {
+          info(`${affChange} Affinity with ${selectedNpc.name}`);
         }
       }
 

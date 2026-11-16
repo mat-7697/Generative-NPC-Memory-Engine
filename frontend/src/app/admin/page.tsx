@@ -22,6 +22,13 @@ import {
   CreateQuestRequest,
   UpdateQuestRequest,
   UpdatePlayerRequest,
+  DatabaseExplorerResponse,
+  TableSchema,
+  ViewSchema,
+  RoutineSchema,
+  SQLWorkbenchResult,
+  ExplainAnalyzeResult,
+  QueryPreset,
 } from '@/lib/api';
 
 type AdminTab = 'stats' | 'players' | 'npcs' | 'items' | 'quests' | 'audit' | 'sql';
@@ -37,12 +44,22 @@ export default function AdminPage() {
   const [sqlQuery, setSqlQuery] = useState<string>(
     `SELECT \n    p.player_id,\n    p.username,\n    p.level,\n    p.gold,\n    COUNT(pi.item_id) AS total_inventory_slots,\n    COALESCE(SUM(pi.quantity * i.base_price), 0) AS inventory_net_worth,\n    p.gold + COALESCE(SUM(pi.quantity * i.base_price), 0) AS total_player_wealth\nFROM players p\nLEFT JOIN player_inventory pi ON p.player_id = pi.player_id\nLEFT JOIN items i ON pi.item_id = i.item_id\nGROUP BY p.player_id, p.username, p.level, p.gold\nORDER BY total_player_wealth DESC;`
   );
-  const [sqlResult, setSqlResult] = useState<any>(null);
-  const [explainResult, setExplainResult] = useState<any>(null);
+  const [sqlResult, setSqlResult] = useState<SQLWorkbenchResult | null>(null);
+  const [explainResult, setExplainResult] = useState<ExplainAnalyzeResult | null>(null);
   const [executingSql, setExecutingSql] = useState(false);
   const [explainingSql, setExplainingSql] = useState(false);
-  const [queryPresets, setQueryPresets] = useState<any[]>([]);
+  const [queryPresets, setQueryPresets] = useState<QueryPreset[]>([]);
   const [sqlViewMode, setSqlViewMode] = useState<'table' | 'explain'>('table');
+  const [sqlMode, setSqlMode] = useState<'read_only' | 'dml'>('read_only');
+  const [confirmCommit, setConfirmCommit] = useState(false);
+  const [selectedPresetCategory, setSelectedPresetCategory] = useState<string>('All');
+
+  // Database Explorer state
+  const [dbExplorer, setDbExplorer] = useState<DatabaseExplorerResponse | null>(null);
+  const [loadingExplorer, setLoadingExplorer] = useState(false);
+  const [explorerSearch, setExplorerSearch] = useState('');
+  const [expandedTable, setExpandedTable] = useState<string | null>(null);
+  const [showExplorer, setShowExplorer] = useState(true);
 
   // Stats Data
   const [stats, setStats] = useState<AdminStats | null>(null);
@@ -295,12 +312,57 @@ export default function AdminPage() {
     }
   };
 
-  // Load Query Presets
-  useEffect(() => {
-    if (activeTab === 'sql' && queryPresets.length === 0) {
-      api.admin.getQueryPresets().then(setQueryPresets).catch(() => {});
+  const loadDbExplorer = useCallback(async () => {
+    setLoadingExplorer(true);
+    try {
+      const data = await api.admin.getDatabaseExplorer();
+      setDbExplorer(data);
+    } catch (err: any) {
+      toastError(err.message || 'Failed to inspect database schema');
+    } finally {
+      setLoadingExplorer(false);
     }
-  }, [activeTab, queryPresets.length]);
+  }, [toastError]);
+
+  // Load Query Presets and DB Explorer when entering SQL tab
+  useEffect(() => {
+    if (activeTab === 'sql') {
+      if (queryPresets.length === 0) {
+        api.admin.getQueryPresets().then(setQueryPresets).catch(() => {});
+      }
+      if (!dbExplorer && !loadingExplorer) {
+        loadDbExplorer();
+      }
+    }
+  }, [activeTab, queryPresets.length, dbExplorer, loadingExplorer, loadDbExplorer]);
+
+  const handleExportCsv = () => {
+    if (!sqlResult || !sqlResult.columns || !sqlResult.rows || sqlResult.rows.length === 0) {
+      toastError('No query rows available to export');
+      return;
+    }
+    const headers = sqlResult.columns;
+    const escapeCell = (val: any) => {
+      if (val === null || val === undefined) return '';
+      const str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+      return `"${str.replace(/"/g, '""')}"`;
+    };
+    const csvContent = [
+      headers.map((h) => `"${h.replace(/"/g, '""')}"`).join(','),
+      ...sqlResult.rows.map((row: any) => headers.map((h) => escapeCell(row[h])).join(',')),
+    ].join('\r\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `sql_results_${Date.now()}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    success('Exported query results to CSV');
+  };
 
   const handleRunSql = async () => {
     if (!sqlQuery.trim()) return;
@@ -308,12 +370,21 @@ export default function AdminPage() {
     setSqlViewMode('table');
     setExplainResult(null);
     try {
-      const res = await api.admin.executeSql(sqlQuery);
+      const res = await api.admin.executeSql(sqlQuery, sqlMode, confirmCommit);
       setSqlResult(res);
       if (!res.success) {
         toastError(res.error || 'Query failed to execute');
       } else {
-        success(`Executed in ${res.execution_time_ms} ms (${res.row_count} rows returned)`);
+        const modeDesc =
+          sqlMode === 'dml'
+            ? confirmCommit
+              ? 'Committed DML'
+              : 'Preview / Rollback DML'
+            : 'Read-Only';
+        const affected = res.affected_rows !== undefined ? `, ${res.affected_rows} affected` : '';
+        success(
+          `[${modeDesc}] Executed in ${res.execution_time_ms} ms (${res.row_count} rows${affected})`
+        );
       }
     } catch (err: any) {
       toastError(err.message || 'Execution error');
@@ -332,7 +403,7 @@ export default function AdminPage() {
       if (!res.success) {
         toastError(res.error || 'EXPLAIN ANALYZE failed');
       } else {
-        success(`Query plan generated: ${res.summary?.execution_time_ms ?? 0} ms`);
+        success(`Query plan generated in ${res.summary?.execution_time_ms ?? 0} ms`);
       }
     } catch (err: any) {
       toastError(err.message || 'EXPLAIN ANALYZE error');
@@ -493,8 +564,8 @@ export default function AdminPage() {
                             {qp.completion_rate !== undefined
                               ? `${qp.completion_rate}%`
                               : `${Math.round(
-                                  (qp.completed_count /
-                                    Math.max(1, qp.active_count + qp.completed_count)) *
+                                  ((qp.completed_count ?? 0) /
+                                    Math.max(1, (qp.active_count ?? 0) + (qp.completed_count ?? 0))) *
                                     100
                                 )}%`}
                           </div>
@@ -560,7 +631,7 @@ export default function AdminPage() {
                             setEditingPlayer(p);
                             setPlayerGold(p.gold);
                             setPlayerLevel(p.level);
-                            setPlayerRole(p.role);
+                            setPlayerRole(p.role === 'admin' ? 'admin' : 'player');
                           }}
                           className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300"
                         >
@@ -890,7 +961,7 @@ export default function AdminPage() {
           </div>
         )}
 
-        {/* TAB 7: SQL CONSOLE & EXPLAIN ANALYZE */}
+        {/* TAB 7: SQL CONSOLE & WORKBENCH */}
         {activeTab === 'sql' && (
           <div className="space-y-6">
             {/* Top Info Banner for Viva */}
@@ -899,30 +970,68 @@ export default function AdminPage() {
                 <span className="text-2xl">🎓</span>
                 <div className="space-y-1">
                   <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <span>Interactive PostgreSQL Console & Execution Plan Benchmarker</span>
+                    <span>Interactive PostgreSQL SQL Workbench & Execution Plan Benchmarker</span>
                     <span className="text-[10px] font-mono bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded border border-cyan-500/30">
-                      ACID & Performance
+                      Live PostgreSQL Database
                     </span>
                   </h3>
                   <p className="text-xs text-slate-300 leading-relaxed">
-                    Designed for your DBMS evaluation. Execute arbitrary SQL queries, benchmark query planning and execution times with <strong className="text-cyan-400">EXPLAIN (ANALYZE, BUFFERS)</strong>, or run queries in the native terminal via <code className="bg-black/50 px-1.5 py-0.5 rounded text-amber-300 font-mono text-[11px]">psql -U postgres -d generative_npc_db</code>.
+                    Interactive SQL console connected to PostgreSQL (<code className="bg-black/50 px-1.5 py-0.5 rounded text-amber-300 font-mono text-[11px]">npc_memory_engine</code>). Execute real queries, benchmark query plans with <strong className="text-cyan-400">EXPLAIN (ANALYZE, BUFFERS)</strong>, inspect schema with the Database Explorer, or test transaction rollback/commit modes.
                   </p>
                 </div>
               </div>
             </div>
 
-            {/* Presets Bar */}
-            <div className="glass-card p-4 rounded-2xl border border-white/10 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">
-                  Curated Viva Query Presets (Select to load):
+            {/* Presets Bar with 12 Viva Categories */}
+            <div className="glass-card p-4 rounded-2xl border border-white/10 space-y-3">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+                <span className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <span>📚</span>
+                  <span>Curated Viva Query Presets ({queryPresets.length}):</span>
                 </span>
                 <span className="text-[11px] text-slate-400">
-                  Click any query below to populate the console
+                  Select a category or click any query below to populate the editor
                 </span>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-1">
-                {queryPresets.map((preset, idx) => (
+
+              {/* Category Filter Pills */}
+              <div className="flex flex-wrap gap-1.5 pb-1">
+                {[
+                  'All',
+                  'Basic SQL',
+                  'Joins',
+                  'Aggregations',
+                  'Subqueries',
+                  'CTE and Recursive CTE',
+                  'Window Functions',
+                  'Views',
+                  'Stored Procedures',
+                  'Triggers',
+                  'Indexing and Query Optimization',
+                  'Full-Text Search',
+                  'DML Operations',
+                ].map((cat) => (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => setSelectedPresetCategory(cat)}
+                    className={`px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase transition ${
+                      selectedPresetCategory === cat
+                        ? 'bg-cyan-500 text-black shadow-md shadow-cyan-500/20'
+                        : 'bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white'
+                    }`}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
+
+              {/* Presets Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-1 max-h-60 overflow-y-auto pr-1">
+                {(selectedPresetCategory === 'All'
+                  ? queryPresets
+                  : queryPresets.filter((p) => p.category === selectedPresetCategory)
+                ).map((preset, idx) => (
                   <button
                     key={idx}
                     type="button"
@@ -949,198 +1058,557 @@ export default function AdminPage() {
               </div>
             </div>
 
-            {/* SQL Query Editor & Actions */}
-            <div className="glass-card p-5 rounded-2xl border border-white/10 space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-mono font-bold text-amber-300 uppercase tracking-wider flex items-center gap-1.5">
-                  <span>⚡</span>
-                  <span>SQL Query Editor:</span>
-                </span>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setSqlQuery('')}
-                    className="text-[11px] text-slate-400 hover:text-white transition px-2 py-1 rounded hover:bg-white/5"
-                  >
-                    Clear Editor
-                  </button>
-                </div>
-              </div>
-
-              <textarea
-                value={sqlQuery}
-                onChange={(e) => setSqlQuery(e.target.value)}
-                rows={7}
-                placeholder="Write any PostgreSQL query here (e.g. SELECT * FROM players;)..."
-                className="w-full font-mono text-xs p-3.5 rounded-xl bg-black/60 text-emerald-300 border border-white/10 focus:border-cyan-400 focus:outline-none leading-relaxed selection:bg-cyan-500/30"
-                spellCheck={false}
-              />
-
-              <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-                <div className="text-[11px] text-slate-400">
-                  Tip: Supports <strong className="text-slate-300">SELECT</strong>, <strong className="text-slate-300">WITH RECURSIVE</strong>, <strong className="text-slate-300">JOINs</strong>, <strong className="text-slate-300">Window Functions</strong>, and <strong className="text-slate-300">DML</strong>.
-                </div>
-                <div className="flex items-center gap-2.5">
-                  <button
-                    type="button"
-                    onClick={handleExplainAnalyze}
-                    disabled={explainingSql || executingSql}
-                    className="py-2 px-4 rounded-xl bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 text-xs font-bold transition flex items-center gap-1.5"
-                  >
-                    <span>⚡</span>
-                    <span>{explainingSql ? 'Analyzing Plan...' : 'EXPLAIN ANALYZE'}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRunSql}
-                    disabled={executingSql || explainingSql}
-                    className="py-2 px-5 rounded-xl bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white text-xs font-bold shadow-lg shadow-cyan-600/20 transition flex items-center gap-1.5"
-                  >
-                    <span>▶️</span>
-                    <span>{executingSql ? 'Executing...' : 'Run Query'}</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Results Section */}
-            {sqlViewMode === 'table' && sqlResult && (
-              <div className="glass-card p-5 rounded-2xl border border-white/10 space-y-4 animate-in fade-in">
-                <div className="flex items-center justify-between border-b border-white/10 pb-3">
-                  <div className="flex items-center gap-2.5">
-                    <span className={`w-2.5 h-2.5 rounded-full ${sqlResult.success ? 'bg-emerald-400' : 'bg-rose-400'}`}></span>
-                    <span className="text-xs font-bold text-white uppercase tracking-wider">
-                      Execution Result
-                    </span>
+            {/* Split Workbench: Database Explorer + SQL Editor */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+              {/* Database Explorer (4 cols on lg) */}
+              <div className="lg:col-span-4 glass-card p-4 rounded-2xl border border-white/10 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-mono font-bold text-cyan-300 uppercase tracking-wider flex items-center gap-1.5">
+                    <span>🗄️</span>
+                    <span>Database Explorer</span>
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={loadDbExplorer}
+                      disabled={loadingExplorer}
+                      className="text-[10px] text-slate-400 hover:text-white transition px-2 py-1 rounded bg-white/5 hover:bg-white/10"
+                      title="Reload Schema"
+                    >
+                      {loadingExplorer ? '...' : '🔄'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowExplorer(!showExplorer)}
+                      className="text-[10px] text-slate-400 hover:text-white transition px-2 py-1 rounded bg-white/5 hover:bg-white/10"
+                    >
+                      {showExplorer ? 'Hide' : 'Show'}
+                    </button>
                   </div>
-                  <div className="flex items-center gap-3 text-xs font-mono">
-                    <span className="text-cyan-300 bg-cyan-500/10 px-2.5 py-0.5 rounded border border-cyan-500/20">
-                      ⏱️ {sqlResult.execution_time_ms} ms
-                    </span>
-                    <span className="text-amber-300 bg-amber-500/10 px-2.5 py-0.5 rounded border border-amber-500/20">
-                      📊 {sqlResult.row_count} rows
-                    </span>
-                    {sqlResult.command && (
-                      <span className="text-purple-300 bg-purple-500/10 px-2.5 py-0.5 rounded border border-purple-500/20">
-                        {sqlResult.command}
-                      </span>
+                </div>
+
+                {showExplorer && (
+                  <div className="space-y-3">
+                    <input
+                      type="text"
+                      placeholder="Search tables, views..."
+                      value={explorerSearch}
+                      onChange={(e) => setExplorerSearch(e.target.value)}
+                      className="w-full text-xs p-2 rounded-lg bg-black/40 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-cyan-400"
+                    />
+
+                    {loadingExplorer ? (
+                      <div className="p-4 text-center text-xs text-slate-400 font-mono">
+                        Inspecting PostgreSQL schema...
+                      </div>
+                    ) : (
+                      <div className="space-y-3 max-h-[500px] overflow-y-auto pr-1">
+                        {/* Tables */}
+                        <div className="space-y-1">
+                          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-1">
+                            Tables ({dbExplorer?.tables?.length ?? 0})
+                          </div>
+                          {(dbExplorer?.tables || [])
+                            .filter((t) =>
+                              t.name.toLowerCase().includes(explorerSearch.toLowerCase())
+                            )
+                            .map((table) => {
+                              const isExpanded = expandedTable === table.name;
+                              return (
+                                <div
+                                  key={table.name}
+                                  className="rounded-lg border border-white/5 bg-white/[0.02] overflow-hidden"
+                                >
+                                  <div
+                                    className="p-2 flex items-center justify-between text-xs cursor-pointer hover:bg-white/5 transition"
+                                    onClick={() =>
+                                      setExpandedTable(isExpanded ? null : table.name)
+                                    }
+                                  >
+                                    <div className="flex items-center gap-1.5 font-mono text-white text-[11px]">
+                                      <span>{isExpanded ? '📂' : '📁'}</span>
+                                      <span className="font-semibold">{table.name}</span>
+                                    </div>
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setSqlQuery(`SELECT * FROM ${table.name} LIMIT 100;`);
+                                        }}
+                                        className="text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30"
+                                        title="Generate SELECT Query"
+                                      >
+                                        Query
+                                      </button>
+                                      <span className="text-[9px] text-slate-500 font-mono">
+                                        {table.columns.length} cols
+                                      </span>
+                                    </div>
+                                  </div>
+
+                                  {isExpanded && (
+                                    <div className="p-2 border-t border-white/5 bg-black/30 space-y-1 text-[10px] font-mono">
+                                      {table.columns.map((col) => (
+                                        <div
+                                          key={col.name}
+                                          className="flex items-center justify-between py-0.5 text-slate-300"
+                                        >
+                                          <div className="flex items-center gap-1">
+                                            {(col.is_pk ?? col.is_primary_key) && (
+                                              <span className="text-amber-400" title="Primary Key">
+                                                🔑
+                                              </span>
+                                            )}
+                                            {(col.is_fk ?? !!col.foreign_key) && (
+                                              <span
+                                                className="text-violet-400"
+                                                title={`Foreign Key -> ${col.foreign_table ?? col.foreign_key?.table ?? 'referenced'}`}
+                                              >
+                                                🔗
+                                              </span>
+                                            )}
+                                            <span className="text-slate-200">{col.name}</span>
+                                          </div>
+                                          <span className="text-slate-500 text-[9px]">{col.type}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                        </div>
+
+                        {/* Views */}
+                        {(dbExplorer?.views?.length ?? 0) > 0 && (
+                          <div className="space-y-1 pt-2">
+                            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-1">
+                              Views ({dbExplorer?.views?.length ?? 0})
+                            </div>
+                            {(dbExplorer?.views || [])
+                              .filter((v) =>
+                                v.name.toLowerCase().includes(explorerSearch.toLowerCase())
+                              )
+                              .map((view) => (
+                                <div
+                                  key={view.name}
+                                  className="p-2 rounded-lg border border-white/5 bg-white/[0.02] flex items-center justify-between text-xs"
+                                >
+                                  <div className="flex items-center gap-1.5 font-mono text-purple-300 text-[11px]">
+                                    <span>👁️</span>
+                                    <span>{view.name}</span>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setSqlQuery(`SELECT * FROM ${view.name} LIMIT 50;`)
+                                    }
+                                    className="text-[9px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 hover:bg-purple-500/30"
+                                  >
+                                    Query
+                                  </button>
+                                </div>
+                              ))}
+                          </div>
+                        )}
+
+                        {/* Stored Procedures & Functions */}
+                        {(dbExplorer?.routines?.length ?? 0) > 0 && (
+                          <div className="space-y-1 pt-2">
+                            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-1">
+                              Procedures & Functions ({dbExplorer?.routines?.length ?? 0})
+                            </div>
+                            {(dbExplorer?.routines || [])
+                              .filter((r) =>
+                                r.name.toLowerCase().includes(explorerSearch.toLowerCase())
+                              )
+                              .map((routine) => (
+                                <div
+                                  key={routine.name}
+                                  className="p-2 rounded-lg border border-white/5 bg-white/[0.02] flex items-center justify-between text-xs font-mono"
+                                >
+                                  <div className="flex items-center gap-1.5 text-emerald-300 text-[11px] truncate">
+                                    <span>⚙️</span>
+                                    <span className="truncate">{routine.name}</span>
+                                  </div>
+                                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                                    {routine.type}
+                                  </span>
+                                </div>
+                              ))}
+                          </div>
+                        )}
+                      </div>
                     )}
                   </div>
-                </div>
-
-                {!sqlResult.success ? (
-                  <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200 font-mono space-y-1">
-                    <div className="font-bold flex items-center gap-2">
-                      <span>❌ PostgreSQL Error</span>
-                      {sqlResult.pg_code && <span className="text-[10px] bg-rose-900/60 px-1.5 py-0.5 rounded">SQLSTATE: {sqlResult.pg_code}</span>}
-                    </div>
-                    <p>{sqlResult.error}</p>
-                  </div>
-                ) : sqlResult.columns.length === 0 ? (
-                  <div className="p-6 text-center text-xs text-slate-400 font-mono">
-                    ✓ Statement executed successfully. Status: <strong className="text-emerald-300">{sqlResult.status || 'OK'}</strong>
-                  </div>
-                ) : (
-                  <div className="overflow-x-auto max-h-96 rounded-xl border border-white/10">
-                    <table className="w-full text-left text-xs">
-                      <thead className="bg-black/60 sticky top-0 z-10 border-b border-white/10">
-                        <tr>
-                          {sqlResult.columns.map((col: string, idx: number) => (
-                            <th key={idx} className="py-2.5 px-3 font-mono font-bold text-cyan-300 text-[11px] whitespace-nowrap">
-                              {col}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-white/5 font-mono text-[11px]">
-                        {sqlResult.rows.map((row: any, rIdx: number) => (
-                          <tr key={rIdx} className="hover:bg-white/[0.03] transition">
-                            {sqlResult.columns.map((col: string, cIdx: number) => (
-                              <td key={cIdx} className="py-2 px-3 text-slate-300 whitespace-nowrap">
-                                {row[col] !== null && row[col] !== undefined ? String(row[col]) : <em className="text-slate-500">NULL</em>}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
                 )}
               </div>
-            )}
 
-            {/* EXPLAIN ANALYZE Result */}
-            {sqlViewMode === 'explain' && explainResult && (
-              <div className="glass-card p-5 rounded-2xl border border-purple-500/30 space-y-4 animate-in fade-in">
-                <div className="flex items-center justify-between border-b border-white/10 pb-3">
-                  <div className="flex items-center gap-2.5">
-                    <span className="text-lg">⚡</span>
-                    <span className="text-xs font-bold text-white uppercase tracking-wider">
-                      PostgreSQL Query Planner & Execution Profile
+              {/* SQL Editor & Controls (8 cols on lg) */}
+              <div className="lg:col-span-8 space-y-4">
+                <div className="glass-card p-5 rounded-2xl border border-white/10 space-y-3">
+                  {/* Editor Header: Title & Mode Toggle */}
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+                    <span className="text-xs font-mono font-bold text-amber-300 uppercase tracking-wider flex items-center gap-1.5">
+                      <span>⚡</span>
+                      <span>PostgreSQL Query Editor:</span>
                     </span>
+
+                    {/* Mode Toggle Pills */}
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center p-0.5 bg-black/50 rounded-xl border border-white/10 text-[11px]">
+                        <button
+                          type="button"
+                          onClick={() => setSqlMode('read_only')}
+                          className={`px-3 py-1 rounded-lg font-bold transition flex items-center gap-1 ${
+                            sqlMode === 'read_only'
+                              ? 'bg-cyan-500 text-black shadow-sm'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          <span>🛡️</span>
+                          <span>Read-Only Mode</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSqlMode('dml')}
+                          className={`px-3 py-1 rounded-lg font-bold transition flex items-center gap-1 ${
+                            sqlMode === 'dml'
+                              ? 'bg-amber-500 text-black shadow-sm'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          <span>✏️</span>
+                          <span>DML Mode</span>
+                        </button>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setSqlQuery('')}
+                        className="text-[11px] text-slate-400 hover:text-white transition px-2 py-1 rounded hover:bg-white/5"
+                      >
+                        Clear
+                      </button>
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setSqlViewMode('table')}
-                    className="text-[11px] text-cyan-400 hover:text-cyan-300 underline"
-                  >
-                    Switch to Data Table View
-                  </button>
+
+                  {/* DML Mode Confirmation / Safeguard Banner */}
+                  {sqlMode === 'dml' && (
+                    <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-xs text-amber-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-base">⚠️</span>
+                        <div>
+                          <strong className="text-white">DML Demonstration Mode:</strong>{' '}
+                          {confirmCommit ? (
+                            <span className="text-rose-300 font-bold">
+                              CHANGES WILL BE COMMITTED TO THE DATABASE!
+                            </span>
+                          ) : (
+                            <span>
+                              Changes are executed in an isolated transaction and{' '}
+                              <strong className="text-amber-300">AUTOMATICALLY ROLLED BACK</strong>{' '}
+                              for preview safety.
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-white bg-black/40 px-3 py-1.5 rounded-lg border border-amber-500/40 shrink-0">
+                        <input
+                          type="checkbox"
+                          checked={confirmCommit}
+                          onChange={(e) => setConfirmCommit(e.target.checked)}
+                          className="rounded border-amber-400 text-amber-500 focus:ring-0"
+                        />
+                        <span>Confirm Commit</span>
+                      </label>
+                    </div>
+                  )}
+
+                  {/* Query Textarea */}
+                  <textarea
+                    value={sqlQuery}
+                    onChange={(e) => setSqlQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                        e.preventDefault();
+                        handleRunSql();
+                      }
+                    }}
+                    rows={8}
+                    placeholder="Write any PostgreSQL query here (e.g. SELECT * FROM players;)..."
+                    className="w-full font-mono text-xs p-3.5 rounded-xl bg-black/60 text-emerald-300 border border-white/10 focus:border-cyan-400 focus:outline-none leading-relaxed selection:bg-cyan-500/30"
+                    spellCheck={false}
+                  />
+
+                  {/* Action Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                    <div className="text-[11px] text-slate-400 font-mono">
+                      <span>Shortcut: </span>
+                      <kbd className="bg-white/10 px-1.5 py-0.5 rounded text-slate-300 text-[10px]">
+                        Ctrl+Enter
+                      </kbd>
+                      <span> to execute.</span>
+                    </div>
+
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={handleExplainAnalyze}
+                        disabled={explainingSql || executingSql || !sqlQuery.trim()}
+                        className="py-2 px-4 rounded-xl bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 text-xs font-bold transition flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="Benchmark single-pass query planner"
+                      >
+                        <span>⚡</span>
+                        <span>{explainingSql ? 'Analyzing...' : 'EXPLAIN ANALYZE'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleRunSql}
+                        disabled={executingSql || explainingSql || !sqlQuery.trim()}
+                        className={`py-2 px-5 rounded-xl text-white text-xs font-bold shadow-lg transition flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${
+                          sqlMode === 'dml'
+                            ? confirmCommit
+                              ? 'bg-rose-600 hover:bg-rose-500 shadow-rose-600/20'
+                              : 'bg-amber-600 hover:bg-amber-500 shadow-amber-600/20'
+                            : 'bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 shadow-cyan-600/20'
+                        }`}
+                      >
+                        <span>{executingSql ? '⏳' : '▶️'}</span>
+                        <span>
+                          {executingSql
+                            ? 'Executing...'
+                            : sqlMode === 'dml'
+                            ? confirmCommit
+                              ? 'Commit DML'
+                              : 'Preview DML'
+                            : 'Run Query'}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
-                {!explainResult.success ? (
-                  <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200 font-mono">
-                    ❌ EXPLAIN Error: {explainResult.error}
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    {/* Summary Metrics */}
-                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-                      <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
-                        <div className="text-[10px] text-slate-400 uppercase tracking-wider">Planning Time</div>
-                        <div className="text-base font-black text-cyan-400 mt-0.5">
-                          {explainResult.summary?.planning_time_ms ?? '-'} ms
-                        </div>
+                {/* Results Section */}
+                {sqlViewMode === 'table' && sqlResult && (
+                  <div className="glass-card p-5 rounded-2xl border border-white/10 space-y-4 animate-in fade-in">
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-white/10 pb-3 gap-2">
+                      <div className="flex items-center gap-2.5">
+                        <span
+                          className={`w-2.5 h-2.5 rounded-full ${
+                            sqlResult.success ? 'bg-emerald-400' : 'bg-rose-400'
+                          }`}
+                        ></span>
+                        <span className="text-xs font-bold text-white uppercase tracking-wider">
+                          Execution Result
+                        </span>
+                        {sqlResult.transaction_status && (
+                          <span
+                            className={`text-[10px] font-mono px-2 py-0.5 rounded uppercase font-bold ${
+                              sqlResult.transaction_status === 'COMMITTED'
+                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                : sqlResult.transaction_status.includes('ROLLED_BACK')
+                                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                            }`}
+                          >
+                            {sqlResult.transaction_status}
+                          </span>
+                        )}
                       </div>
-                      <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
-                        <div className="text-[10px] text-slate-400 uppercase tracking-wider">Execution Time</div>
-                        <div className="text-base font-black text-emerald-400 mt-0.5">
-                          {explainResult.summary?.execution_time_ms ?? '-'} ms
-                        </div>
-                      </div>
-                      <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
-                        <div className="text-[10px] text-slate-400 uppercase tracking-wider">Root Scan Type</div>
-                        <div className="text-xs font-bold text-purple-300 mt-1 font-mono truncate">
-                          {explainResult.summary?.node_type ?? '-'}
-                        </div>
-                      </div>
-                      <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
-                        <div className="text-[10px] text-slate-400 uppercase tracking-wider">Optimizer Cost</div>
-                        <div className="text-base font-black text-amber-300 mt-0.5">
-                          {explainResult.summary?.total_cost ?? '-'}
-                        </div>
-                      </div>
-                      <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
-                        <div className="text-[10px] text-slate-400 uppercase tracking-wider">Shared Buffer Hits</div>
-                        <div className="text-base font-black text-blue-400 mt-0.5">
-                          {explainResult.summary?.shared_hit_blocks ?? 0} blocks
-                        </div>
+
+                      <div className="flex items-center gap-2 text-xs font-mono">
+                        <span className="text-cyan-300 bg-cyan-500/10 px-2.5 py-0.5 rounded border border-cyan-500/20">
+                          ⏱️ {sqlResult.execution_time_ms} ms
+                        </span>
+                        <span className="text-amber-300 bg-amber-500/10 px-2.5 py-0.5 rounded border border-amber-500/20">
+                          📊 {sqlResult.row_count} rows
+                        </span>
+                        {sqlResult.affected_rows !== undefined && (
+                          <span className="text-emerald-300 bg-emerald-500/10 px-2.5 py-0.5 rounded border border-emerald-500/20">
+                            ✏️ {sqlResult.affected_rows} affected
+                          </span>
+                        )}
+                        {sqlResult.rows && sqlResult.rows.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={handleExportCsv}
+                            className="text-[11px] font-sans font-bold px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-slate-200 border border-white/10 transition flex items-center gap-1"
+                            title="Download CSV"
+                          >
+                            <span>📥</span>
+                            <span>Export CSV</span>
+                          </button>
+                        )}
                       </div>
                     </div>
 
-                    {/* Text Execution Plan */}
-                    <div className="p-4 rounded-xl bg-black/60 border border-white/10 overflow-x-auto">
-                      <div className="text-[10px] text-slate-400 font-mono uppercase tracking-wider mb-2">
-                        Execution Plan Tree:
+                    {!sqlResult.success ? (
+                      <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200 font-mono space-y-1">
+                        <div className="font-bold flex items-center gap-2">
+                          <span>❌ PostgreSQL Error</span>
+                          {sqlResult.pg_code && (
+                            <span className="text-[10px] bg-rose-900/60 px-1.5 py-0.5 rounded">
+                              SQLSTATE: {sqlResult.pg_code}
+                            </span>
+                          )}
+                        </div>
+                        <p className="leading-relaxed">{sqlResult.error}</p>
                       </div>
-                      <pre className="font-mono text-xs text-slate-200 leading-relaxed whitespace-pre">
-                        {explainResult.text_plan}
-                      </pre>
+                    ) : !sqlResult.columns || sqlResult.columns.length === 0 ? (
+                      <div className="p-6 text-center text-xs text-slate-400 font-mono space-y-1">
+                        <div>✓ Statement executed successfully.</div>
+                        <div className="text-emerald-300 font-bold">
+                          Status: {sqlResult.status || 'OK'}
+                        </div>
+                        {sqlResult.affected_rows !== undefined && (
+                          <div className="text-slate-400">
+                            Affected rows: <strong className="text-white">{sqlResult.affected_rows}</strong>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto max-h-96 rounded-xl border border-white/10">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-black/60 sticky top-0 z-10 border-b border-white/10">
+                            <tr>
+                              {(sqlResult.columns || []).map((col: string, idx: number) => (
+                                <th
+                                  key={idx}
+                                  className="py-2.5 px-3 font-mono font-bold text-cyan-300 text-[11px] whitespace-nowrap"
+                                >
+                                  {col}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5 font-mono text-[11px]">
+                            {(sqlResult.rows || []).map((row: any, rIdx: number) => (
+                              <tr key={rIdx} className="hover:bg-white/[0.03] transition">
+                                {(sqlResult.columns || []).map((col: string, cIdx: number) => {
+                                  const val = row[col];
+                                  return (
+                                    <td
+                                      key={cIdx}
+                                      className="py-2 px-3 text-slate-300 whitespace-nowrap"
+                                    >
+                                      {val === null || val === undefined ? (
+                                        <em className="text-slate-500 font-normal">NULL</em>
+                                      ) : typeof val === 'object' ? (
+                                        <code className="text-amber-300 bg-amber-500/10 px-1 py-0.5 rounded text-[10px]">
+                                          {JSON.stringify(val)}
+                                        </code>
+                                      ) : typeof val === 'boolean' ? (
+                                        <span
+                                          className={`px-1.5 py-0.2 rounded text-[10px] font-bold ${
+                                            val
+                                              ? 'bg-emerald-500/20 text-emerald-300'
+                                              : 'bg-rose-500/20 text-rose-300'
+                                          }`}
+                                        >
+                                          {String(val)}
+                                        </span>
+                                      ) : (
+                                        String(val)
+                                      )}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* EXPLAIN ANALYZE Result */}
+                {sqlViewMode === 'explain' && explainResult && (
+                  <div className="glass-card p-5 rounded-2xl border border-purple-500/30 space-y-4 animate-in fade-in">
+                    <div className="flex items-center justify-between border-b border-white/10 pb-3">
+                      <div className="flex items-center gap-2.5">
+                        <span className="text-lg">⚡</span>
+                        <span className="text-xs font-bold text-white uppercase tracking-wider">
+                          PostgreSQL Query Planner & Execution Profile (Single Run)
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSqlViewMode('table')}
+                        className="text-[11px] text-cyan-400 hover:text-cyan-300 underline"
+                      >
+                        Switch to Data Table View
+                      </button>
                     </div>
+
+                    {!explainResult.success ? (
+                      <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200 font-mono">
+                        ❌ EXPLAIN Error: {explainResult.error}
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        {/* Summary Metrics */}
+                        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                          <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
+                            <div className="text-[10px] text-slate-400 uppercase tracking-wider">
+                              Planning Time
+                            </div>
+                            <div className="text-base font-black text-cyan-400 mt-0.5">
+                              {explainResult.summary?.planning_time_ms ?? '-'} ms
+                            </div>
+                          </div>
+                          <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
+                            <div className="text-[10px] text-slate-400 uppercase tracking-wider">
+                              Execution Time
+                            </div>
+                            <div className="text-base font-black text-emerald-400 mt-0.5">
+                              {explainResult.summary?.execution_time_ms ?? '-'} ms
+                            </div>
+                          </div>
+                          <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
+                            <div className="text-[10px] text-slate-400 uppercase tracking-wider">
+                              Root Scan Type
+                            </div>
+                            <div className="text-xs font-bold text-purple-300 mt-1 font-mono truncate">
+                              {explainResult.summary?.node_type ?? '-'}
+                            </div>
+                          </div>
+                          <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
+                            <div className="text-[10px] text-slate-400 uppercase tracking-wider">
+                              Optimizer Cost
+                            </div>
+                            <div className="text-base font-black text-amber-300 mt-0.5">
+                              {explainResult.summary?.total_cost ?? '-'}
+                            </div>
+                          </div>
+                          <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10">
+                            <div className="text-[10px] text-slate-400 uppercase tracking-wider">
+                              Shared Buffer Hits
+                            </div>
+                            <div className="text-base font-black text-blue-400 mt-0.5">
+                              {explainResult.summary?.shared_hit_blocks ?? 0} blocks
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Text Execution Plan */}
+                        <div className="p-4 rounded-xl bg-black/60 border border-white/10 overflow-x-auto">
+                          <div className="text-[10px] text-slate-400 font-mono uppercase tracking-wider mb-2">
+                            Execution Plan Tree:
+                          </div>
+                          <pre className="font-mono text-xs text-slate-200 leading-relaxed whitespace-pre">
+                            {explainResult.text_plan}
+                          </pre>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
-            )}
+            </div>
           </div>
         )}
 

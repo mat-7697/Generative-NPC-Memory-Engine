@@ -38,6 +38,18 @@ async def update_my_profile(
     conn: asyncpg.Connection = Depends(get_db),
 ):
     """Update profile fields for the authenticated player."""
+    # RBAC constraint: only admins can directly overwrite gold, level, or xp via API
+    if current_user.role != "admin":
+        if (
+            update_data.gold is not None
+            or update_data.level is not None
+            or update_data.xp is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Modifying gold, level, or xp directly requires administrative clearance. Earn gold and XP through gameplay or contact an administrator.",
+            )
+
     # Check if email is being changed and if it is already taken
     if update_data.email is not None:
         conflict = await conn.fetchrow(
@@ -76,7 +88,6 @@ async def update_my_profile(
         idx += 1
 
     if not fields:
-        # No updates provided, return current profile
         row = await conn.fetchrow(
             "SELECT player_id, username, email, role, gold, level, xp, created_at FROM players WHERE player_id = $1",
             current_user.player_id,

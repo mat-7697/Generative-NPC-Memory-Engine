@@ -5,29 +5,18 @@
 -- Description: Core relational schema covering authentication, player progression,
 --              NPC persona metadata, item catalog, quest graph prerequisites,
 --              atomic transactional inventory, and comprehensive audit logging.
+-- Note: Normal initialization is non-destructive. For a full teardown, use db/reset.sql.
 -- ============================================================================
 
 -- Ensure standard extensions
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-
--- Drop existing tables in reverse dependency order if recreating
-DROP TABLE IF EXISTS audit_log CASCADE;
-DROP TABLE IF EXISTS npc_relationships CASCADE;
-DROP TABLE IF EXISTS inventory_transactions CASCADE;
-DROP TABLE IF EXISTS quest_prerequisites CASCADE;
-DROP TABLE IF EXISTS player_quests CASCADE;
-DROP TABLE IF EXISTS player_inventory CASCADE;
-DROP TABLE IF EXISTS quests CASCADE;
-DROP TABLE IF EXISTS items CASCADE;
-DROP TABLE IF EXISTS npcs CASCADE;
-DROP TABLE IF EXISTS players CASCADE;
 
 -- ----------------------------------------------------------------------------
 -- 1. PLAYERS TABLE
 -- Stores account credentials, role-based access control flags, progression,
 -- and economic currency balances.
 -- ----------------------------------------------------------------------------
-CREATE TABLE players (
+CREATE TABLE IF NOT EXISTS players (
     player_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     username VARCHAR(50) UNIQUE NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -45,7 +34,7 @@ CREATE TABLE players (
 -- Stores metadata, static persona, greeting dialogue, and structured personality
 -- traits in JSONB format for dynamic LLM context synthesis.
 -- ----------------------------------------------------------------------------
-CREATE TABLE npcs (
+CREATE TABLE IF NOT EXISTS npcs (
     npc_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name VARCHAR(100) UNIQUE NOT NULL,
     persona TEXT NOT NULL,
@@ -60,7 +49,7 @@ CREATE TABLE npcs (
 -- Comprehensive catalog of items with base pricing, rarity classification,
 -- available merchant stock (-1 indicates infinite stock), and tsvector for FTS.
 -- ----------------------------------------------------------------------------
-CREATE TABLE items (
+CREATE TABLE IF NOT EXISTS items (
     item_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name VARCHAR(100) UNIQUE NOT NULL,
     description TEXT,
@@ -77,7 +66,7 @@ CREATE TABLE items (
 -- Quest registry detailing reward structures, progression prerequisites,
 -- item rewards, minimum level gates, and tsvector for search queries.
 -- ----------------------------------------------------------------------------
-CREATE TABLE quests (
+CREATE TABLE IF NOT EXISTS quests (
     quest_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     title VARCHAR(200) NOT NULL,
     description TEXT,
@@ -99,7 +88,7 @@ CREATE TABLE quests (
 -- Relates players to items with quantity tracking and acquisition timestamp.
 -- Enforces uniqueness per player-item pair.
 -- ----------------------------------------------------------------------------
-CREATE TABLE player_inventory (
+CREATE TABLE IF NOT EXISTS player_inventory (
     inventory_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     player_id INTEGER NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
     item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
@@ -112,7 +101,7 @@ CREATE TABLE player_inventory (
 -- 6. PLAYER_QUESTS TABLE
 -- Tracks quest lifecycle for each player (available -> active -> completed/failed).
 -- ----------------------------------------------------------------------------
-CREATE TABLE player_quests (
+CREATE TABLE IF NOT EXISTS player_quests (
     player_quest_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     player_id INTEGER NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
     quest_id INTEGER NOT NULL REFERENCES quests(quest_id) ON DELETE CASCADE,
@@ -127,7 +116,7 @@ CREATE TABLE player_quests (
 -- Directed Acyclic Graph (DAG) adjacency list representing prerequisite chains.
 -- Prevents self-dependency via CHECK constraint.
 -- ----------------------------------------------------------------------------
-CREATE TABLE quest_prerequisites (
+CREATE TABLE IF NOT EXISTS quest_prerequisites (
     prerequisite_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     quest_id INTEGER NOT NULL REFERENCES quests(quest_id) ON DELETE CASCADE,
     required_quest_id INTEGER NOT NULL REFERENCES quests(quest_id) ON DELETE CASCADE,
@@ -140,7 +129,7 @@ CREATE TABLE quest_prerequisites (
 -- Immutable ledger recording economic transactions, trade movements,
 -- reward grants, and administrative allocations.
 -- ----------------------------------------------------------------------------
-CREATE TABLE inventory_transactions (
+CREATE TABLE IF NOT EXISTS inventory_transactions (
     transaction_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     player_id INTEGER NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
     item_id INTEGER REFERENCES items(item_id) ON DELETE SET NULL,
@@ -156,7 +145,7 @@ CREATE TABLE inventory_transactions (
 -- Dynamic affinity tracker measuring relational sentiment between players and NPCs.
 -- Clamped between -100.00 (hostile) and +100.00 (revered).
 -- ----------------------------------------------------------------------------
-CREATE TABLE npc_relationships (
+CREATE TABLE IF NOT EXISTS npc_relationships (
     relationship_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     player_id INTEGER NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
     npc_id INTEGER NOT NULL REFERENCES npcs(npc_id) ON DELETE CASCADE,
@@ -171,7 +160,7 @@ CREATE TABLE npc_relationships (
 -- General-purpose JSONB-based audit log recording row mutations across critical
 -- application entities for auditing, compliance, and debugging.
 -- ----------------------------------------------------------------------------
-CREATE TABLE audit_log (
+CREATE TABLE IF NOT EXISTS audit_log (
     log_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     table_name VARCHAR(100) NOT NULL,
     operation VARCHAR(10) NOT NULL CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE')),
@@ -187,28 +176,28 @@ CREATE TABLE audit_log (
 -- ============================================================================
 
 -- B-Tree Indexes on Foreign Key Columns
-CREATE INDEX idx_quests_reward_item_id ON quests(reward_item_id);
-CREATE INDEX idx_player_inventory_player_id ON player_inventory(player_id);
-CREATE INDEX idx_player_inventory_item_id ON player_inventory(item_id);
-CREATE INDEX idx_player_quests_player_id ON player_quests(player_id);
-CREATE INDEX idx_player_quests_quest_id ON player_quests(quest_id);
-CREATE INDEX idx_quest_prerequisites_quest_id ON quest_prerequisites(quest_id);
-CREATE INDEX idx_quest_prerequisites_required_quest_id ON quest_prerequisites(required_quest_id);
-CREATE INDEX idx_inventory_transactions_player_id ON inventory_transactions(player_id);
-CREATE INDEX idx_inventory_transactions_item_id ON inventory_transactions(item_id);
-CREATE INDEX idx_npc_relationships_player_id ON npc_relationships(player_id);
-CREATE INDEX idx_npc_relationships_npc_id ON npc_relationships(npc_id);
+CREATE INDEX IF NOT EXISTS idx_quests_reward_item_id ON quests(reward_item_id);
+CREATE INDEX IF NOT EXISTS idx_player_inventory_player_id ON player_inventory(player_id);
+CREATE INDEX IF NOT EXISTS idx_player_inventory_item_id ON player_inventory(item_id);
+CREATE INDEX IF NOT EXISTS idx_player_quests_player_id ON player_quests(player_id);
+CREATE INDEX IF NOT EXISTS idx_player_quests_quest_id ON player_quests(quest_id);
+CREATE INDEX IF NOT EXISTS idx_quest_prerequisites_quest_id ON quest_prerequisites(quest_id);
+CREATE INDEX IF NOT EXISTS idx_quest_prerequisites_required_quest_id ON quest_prerequisites(required_quest_id);
+CREATE INDEX IF NOT EXISTS idx_inventory_transactions_player_id ON inventory_transactions(player_id);
+CREATE INDEX IF NOT EXISTS idx_inventory_transactions_item_id ON inventory_transactions(item_id);
+CREATE INDEX IF NOT EXISTS idx_npc_relationships_player_id ON npc_relationships(player_id);
+CREATE INDEX IF NOT EXISTS idx_npc_relationships_npc_id ON npc_relationships(npc_id);
 
 -- GIN Indexes on Full-Text Search Vectors
-CREATE INDEX idx_items_search_vector ON items USING GIN(search_vector);
-CREATE INDEX idx_quests_search_vector ON quests USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_items_search_vector ON items USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_quests_search_vector ON quests USING GIN(search_vector);
 
 -- Composite Indexes
-CREATE INDEX idx_player_inventory_composite ON player_inventory(player_id, item_id);
-CREATE INDEX idx_player_quests_composite ON player_quests(player_id, quest_id);
-CREATE INDEX idx_inventory_transactions_player_created ON inventory_transactions(player_id, created_at DESC);
-CREATE INDEX idx_audit_log_table_changed ON audit_log(table_name, changed_at DESC);
-CREATE INDEX idx_npc_relationships_composite ON npc_relationships(player_id, npc_id);
+CREATE INDEX IF NOT EXISTS idx_player_inventory_composite ON player_inventory(player_id, item_id);
+CREATE INDEX IF NOT EXISTS idx_player_quests_composite ON player_quests(player_id, quest_id);
+CREATE INDEX IF NOT EXISTS idx_inventory_transactions_player_created ON inventory_transactions(player_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_table_changed ON audit_log(table_name, changed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_npc_relationships_composite ON npc_relationships(player_id, npc_id);
 
 -- ============================================================================
 -- TRIGGER FUNCTIONS AND AUTOMATED SCHEMA TRIGGERS

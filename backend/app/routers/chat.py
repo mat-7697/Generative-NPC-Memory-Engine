@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 import traceback
@@ -57,73 +58,85 @@ async def chat_with_npc(
     current_user: TokenData = Depends(get_current_user),
     conn: asyncpg.Connection = Depends(get_db),
 ):
-    """End-to-end multimodal fusion chat pipeline linking PostgreSQL relational context and Qdrant vector memory."""
+    """End-to-end multimodal fusion chat pipeline.
+
+    Execution Pipeline (Optimized Non-Blocking & Transaction Isolated):
+    1. Fast relational state retrieval (no long-lived transaction held).
+    2. Asynchronous embedding computation off the event loop.
+    3. Non-blocking semantic vector retrieval from Qdrant.
+    4. Prompt synthesis with Big-Five personality traits & game state context.
+    5. Asynchronous LLM inference outside of database transactions.
+    6. Atomic, short-lived PostgreSQL transaction to commit relationship progression.
+    7. Asynchronous memory persistence into Qdrant vector index.
+    """
     try:
+        # 1. Load comprehensive game state from PostgreSQL (fast read, no lock held)
+        game_state = await load_game_state(
+            conn, current_user.player_id, chat_data.npc_id
+        )
+        npc = game_state.get("npc")
+        if not npc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"NPC with ID {chat_data.npc_id} does not exist",
+            )
+
+        # 2. Embed the player's message in thread pool to prevent blocking FastAPI event loop
+        query_vector = await asyncio.to_thread(embed_text, chat_data.message)
+
+        # 3. Retrieve relevant past memories from Qdrant in thread pool
+        retrieved_memories: List[dict] = []
+        q_client = None
+        try:
+            from app.qdrant_client import get_qdrant_client
+            q_client = get_qdrant_client()
+            retrieved_memories = await asyncio.to_thread(
+                search_memories,
+                client=q_client,
+                player_id=current_user.player_id,
+                npc_id=chat_data.npc_id,
+                query_vector=query_vector,
+                top_k=5,
+            )
+        except Exception as exc:
+            logger.warning("Qdrant unavailable for memory retrieval: %s", exc)
+            retrieved_memories = []
+
+        # 4. Build system prompt and context incorporating persona and state
+        system_prompt, context = build_prompt(
+            npc=npc,
+            game_state=game_state,
+            memories=retrieved_memories,
+            player_message=chat_data.message,
+        )
+
+        # 5. Generate LLM response asynchronously OUTSIDE of any database transaction
+        npc_reply = await asyncio.to_thread(
+            generate_response,
+            system_prompt=system_prompt,
+            user_message=chat_data.message,
+            context=context,
+        )
+
+        # 6. Atomic, quick PostgreSQL transaction to update relationship affinity and counts
+        affinity_delta = _compute_affinity_delta(chat_data.message)
         async with conn.transaction():
-            # 1. Load comprehensive game state from PostgreSQL
-            game_state = await load_game_state(
-                conn, current_user.player_id, chat_data.npc_id
-            )
-            npc = game_state.get("npc")
-            if not npc:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"NPC with ID {chat_data.npc_id} does not exist",
-                )
-
-            # 2. Embed the player's message
-            query_vector = embed_text(chat_data.message)
-
-            # 3. Retrieve relevant past memories from Qdrant (graceful fallback if offline)
-            retrieved_memories: List[dict] = []
-            q_client = None
-            try:
-                from app.qdrant_client import get_qdrant_client
-                q_client = get_qdrant_client()
-                retrieved_memories = search_memories(
-                    client=q_client,
-                    player_id=current_user.player_id,
-                    npc_id=chat_data.npc_id,
-                    query_vector=query_vector,
-                    top_k=5,
-                )
-            except Exception as exc:
-                logger.warning("Qdrant unavailable for memory retrieval: %s", exc)
-                retrieved_memories = []
-
-            # 4. Build system prompt and context incorporating persona and state
-            system_prompt, context = build_prompt(
-                npc=npc,
-                game_state=game_state,
-                memories=retrieved_memories,
-                player_message=chat_data.message,
-            )
-
-            # 5. Generate LLM response (Google Gemini or deterministic Mock)
-            npc_reply = generate_response(
-                system_prompt=system_prompt,
-                user_message=chat_data.message,
-                context=context,
-            )
-
-            # 6. Calculate heuristic affinity delta and update relationship in DB
-            affinity_delta = _compute_affinity_delta(chat_data.message)
             new_affinity = await update_relationship(
                 conn=conn,
                 player_id=current_user.player_id,
                 npc_id=chat_data.npc_id,
                 affinity_delta=affinity_delta,
             )
-            game_state["relationship"]["affinity_score"] = new_affinity
-            game_state["relationship"]["interaction_count"] += 1
+        game_state["relationship"]["affinity_score"] = new_affinity
+        game_state["relationship"]["interaction_count"] += 1
 
-        # 7. Store both player query and NPC reply into Qdrant as persistent memories
+        # 7. Asynchronously store player query and NPC reply into Qdrant as persistent memories
         now = time.time()
         player_mem_id = str(uuid.uuid4())
         npc_mem_id = str(uuid.uuid4())
 
         player_vector = query_vector
-        npc_vector = embed_text(npc_reply)
+        npc_vector = await asyncio.to_thread(embed_text, npc_reply)
 
         if q_client is not None:
             try:
@@ -158,7 +171,8 @@ async def chat_with_npc(
                         },
                     ),
                 ]
-                q_client.upsert(
+                await asyncio.to_thread(
+                    q_client.upsert,
                     collection_name=settings.qdrant_collection,
                     points=points_to_upsert,
                 )

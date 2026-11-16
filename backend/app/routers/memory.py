@@ -24,17 +24,37 @@ router = APIRouter(tags=["Generative Memory (Qdrant)"])
 
 @router.get("/stats", response_model=MemoryStats)
 async def get_memory_stats(
-    _: TokenData = Depends(get_current_user),
+    current_user: TokenData = Depends(get_current_user),
 ):
-    """Retrieve statistical aggregations of vector memories in Qdrant across NPCs and players."""
+    """Retrieve statistical aggregations of vector memories in Qdrant.
+
+    Privacy & Tenant Isolation:
+    - Administrators receive global statistics across all players and NPCs.
+    - Standard players receive statistics strictly isolated to their own player_id.
+    """
     settings = get_settings()
     client = get_qdrant_client()
     collection_name = settings.qdrant_collection
 
+    is_admin = (current_user.role == "admin")
+    scroll_filter = None
+    if not is_admin:
+        scroll_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="player_id", match=models.MatchValue(value=current_user.player_id)
+                )
+            ]
+        )
+
     try:
-        count_res = client.count(collection_name=collection_name, exact=True)
+        count_res = client.count(
+            collection_name=collection_name,
+            count_filter=scroll_filter,
+            exact=True,
+        )
         total_memories = count_res.count
-    except Exception as exc:
+    except Exception:
         # Graceful fallback when Qdrant is offline or starting up
         return MemoryStats(
             total_memories=0,
@@ -43,7 +63,6 @@ async def get_memory_stats(
             recent=[],
         )
 
-    # Scroll sample points to aggregate distribution
     by_npc = []
     by_player = []
     recent = []
@@ -51,6 +70,7 @@ async def get_memory_stats(
     try:
         scroll_res, _ = client.scroll(
             collection_name=collection_name,
+            scroll_filter=scroll_filter,
             limit=500,
             with_payload=True,
             with_vectors=False,
@@ -64,6 +84,11 @@ async def get_memory_stats(
             p = point.payload or {}
             n_id = p.get("npc_id")
             pl_id = p.get("player_id")
+
+            # Enforce player data isolation: regular player must never see other player ids
+            if not is_admin and pl_id != current_user.player_id:
+                continue
+
             if n_id is not None:
                 npc_counts[n_id] += 1
             if pl_id is not None:
@@ -130,7 +155,7 @@ async def search_memories(
             query_filter=query_filter,
             limit=top_k * 2,
         )
-    except Exception as exc:
+    except Exception:
         # Graceful fallback when Qdrant is offline
         return []
 

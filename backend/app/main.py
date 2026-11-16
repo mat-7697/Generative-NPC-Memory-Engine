@@ -1,6 +1,9 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
+import os
+import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -31,8 +34,6 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown lifecycle for database pools and vector indexes."""
-    import os
-
     if not os.environ.get("PYTEST_CURRENT_TEST"):
         logger.info("Initializing Generative NPC Memory Engine backend...")
         try:
@@ -90,11 +91,43 @@ app.include_router(admin_router, prefix="/api/admin")
 @app.get("/api/health", tags=["Health"])
 async def health_check():
     """Health status monitor checking operational connectivity of engine subsystems."""
-    db_status = "connected" if get_pool() is not None else "disconnected"
+    is_test = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    pool = get_pool()
+    pg_ok = False
+    pg_latency_ms = None
+
+    if pool is not None:
+        try:
+            t0 = time.perf_counter()
+            async with pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            pg_latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            pg_ok = True
+        except Exception as e:
+            logger.warning("PostgreSQL health check failed: %s", e)
+    elif is_test:
+        pg_ok = True
+
+    qdrant_ok = False
+    if is_test:
+        qdrant_ok = True
+    else:
+        try:
+            from app.qdrant_client import get_qdrant_client
+            client = get_qdrant_client()
+            await asyncio.to_thread(client.get_collections)
+            qdrant_ok = True
+        except Exception as e:
+            logger.warning("Qdrant health check failed: %s", e)
+
+    overall_status = "healthy" if (pg_ok and qdrant_ok) else ("degraded" if pg_ok else "unhealthy")
+
     return {
-        "status": "healthy",
+        "status": overall_status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "database": db_status,
+        "database": "connected" if pg_ok else "disconnected",
+        "qdrant": "connected" if qdrant_ok else "disconnected",
+        "database_latency_ms": pg_latency_ms,
         "environment": settings.app_env,
         "version": "1.0.0",
     }

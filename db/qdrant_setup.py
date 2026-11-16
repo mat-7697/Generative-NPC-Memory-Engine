@@ -102,8 +102,7 @@ def setup_qdrant(recreate: bool = False):
     info = client.get_collection(collection_name=collection_name)
     print("\n=== Setup Complete ===")
     print(f"Status: {info.status}")
-    print(f"Vectors Count: {info.vectors_count or 0}")
-    print(f"Points Count: {info.points_count or 0}")
+    print(f"Points Count: {getattr(info, 'points_count', getattr(info, 'vectors_count', 0)) or 0}")
     print("Qdrant is ready for Generative NPC Memory operations!\n")
 
 
