@@ -38,6 +38,10 @@ class PlayerQuestResponse(BaseModel):
 
 class QuestCompleteRequest(BaseModel):
     solution: Optional[str] = Field(None, description="Player submitted solution or CTF flag to complete quest")
+    answer: Optional[str] = Field(None, description="Alias for `solution` (sent by the web client)")
+
+    def submitted(self) -> str:
+        return (self.solution or self.answer or "").strip()
 
 
 class PrerequisiteChain(BaseModel):

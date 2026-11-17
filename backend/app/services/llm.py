@@ -24,6 +24,11 @@ def _generate_gemini_response(
     full_context = system_prompt
     if context:
         full_context += f"\n\n--- RECALLED MEMORIES / CONTEXT ---\n{context}"
+    # Short replies read better in the chat panel and come back much faster.
+    full_context += (
+        "\n\nRESPONSE LENGTH: Reply in at most 3 short sentences (under 70 words). "
+        "At most one brief *action* in asterisks. No lists or headings."
+    )
 
     # 1. Attempt using official google.generativeai SDK if installed
     try:
@@ -46,41 +51,58 @@ def _generate_gemini_response(
     # 2. Attempt using direct Gemini REST API via httpx (built-in, zero external SDK needed)
     try:
         import httpx
+    except ImportError:
+        logger.error("httpx is not installed. Falling back to mock provider.")
+        return _generate_mock_response(system_prompt, user_message, context)
 
-        # Standard Google Generative Language REST v1beta endpoint
-        model_name = settings.gemini_model.replace("models/", "")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    # Primary model from settings, then a lightweight fallback if Google is overloaded
+    # (HTTP 429/503) or slow. Keeps live demos responsive.
+    primary = settings.gemini_model.replace("models/", "")
+    models_to_try = [primary] + [m for m in ("gemini-flash-lite-latest",) if m != primary]
 
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": full_context}]
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": user_message}]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 350
-            }
-        }
+    payload_base = {
+        "system_instruction": {"parts": [{"text": full_context}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+    }
 
-        with httpx.Client(timeout=15.0) as client:
-            resp = client.post(url, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts and "text" in parts[0]:
-                        return parts[0]["text"].strip()
-            else:
-                logger.error("Gemini REST API error (status %d): %s", resp.status_code, resp.text)
+    for model_name in models_to_try:
+        # Standard Google Generative Language REST v1beta endpoint.
+        # The key is sent in a header (not the URL) so it never appears in logs or tracebacks.
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        generation_config = {"temperature": 0.7, "maxOutputTokens": 512}
+        # Gemini 2.5 Flash models "think" by default and those tokens count against
+        # maxOutputTokens, which can leave the reply empty. NPC dialogue doesn't need it.
+        if "2.5-flash" in model_name:
+            generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+        payload = {**payload_base, "generationConfig": generation_config}
 
-    except Exception as exc:
-        logger.error("Direct Gemini REST call failed: %s. Falling back to mock provider.", exc)
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                resp = client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+        except httpx.TimeoutException:
+            logger.warning("Gemini (%s) timed out; trying next option.", model_name)
+            continue
+        except Exception as exc:
+            logger.error("Gemini (%s) request failed: %s", model_name, exc)
+            continue
+
+        if resp.status_code == 200:
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    logger.info("Gemini (%s) generated a live NPC reply.", model_name)
+                    return text
+            logger.warning("Gemini (%s) returned no text (finish reason: %s).", model_name,
+                           candidates[0].get("finishReason") if candidates else "no candidates")
+        elif resp.status_code in (429, 500, 503):
+            logger.warning("Gemini (%s) busy (HTTP %d); trying next option.", model_name, resp.status_code)
+        else:
+            logger.error("Gemini (%s) API error (HTTP %d): %s", model_name, resp.status_code, resp.text[:500])
+
+    logger.error("All Gemini attempts failed. Falling back to mock provider.")
 
     return _generate_mock_response(system_prompt, user_message, context)
 

@@ -39,11 +39,25 @@ def get_qdrant_client() -> QdrantClient:
             settings.qdrant_host,
             settings.qdrant_port,
         )
-        _client = QdrantClient(
+        server_client = QdrantClient(
             host=settings.qdrant_host,
             port=settings.qdrant_port,
             timeout=2.0,
         )
+        try:
+            server_client.get_collections()
+            _client = server_client
+        except Exception as exc:
+            # No Qdrant server running (e.g. no Docker) -> use embedded on-disk mode.
+            from pathlib import Path
+
+            local_path = Path(__file__).resolve().parent.parent / "qdrant_local_data"
+            logger.warning(
+                "Qdrant server unreachable (%s). Using embedded local Qdrant at %s",
+                exc,
+                local_path,
+            )
+            _client = QdrantClient(path=str(local_path))
     return _client
 
 

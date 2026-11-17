@@ -63,7 +63,17 @@ async def get_db() -> AsyncGenerator[asyncpg.Connection, None]:
     """FastAPI dependency to acquire a connection from the pool and return it after use."""
     global db_pool
     if db_pool is None:
-        await init_db()
+        try:
+            await init_db()
+        except Exception as exc:
+            # Raise a proper HTTP error (with CORS headers) instead of crashing,
+            # so the browser shows the real reason rather than "Failed to fetch".
+            from fastapi import HTTPException
+
+            raise HTTPException(
+                status_code=503,
+                detail=f"Database unavailable: {exc}. Run 'python setup_db.py' in the backend folder.",
+            )
 
     assert db_pool is not None, "Database pool failed to initialize"
     async with db_pool.acquire() as connection:

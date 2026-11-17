@@ -163,7 +163,7 @@ def inspect_sql_statement(clean_sql: str) -> Dict[str, Any]:
         }
 
     # DML detection (INSERT, UPDATE, DELETE)
-    dml_keywords = {"INSERT", "UPDATE", "DELETE"}
+    dml_keywords = {"INSERT", "UPDATE", "DELETE", "CALL"}
     if first_keyword in dml_keywords:
         return {
             "valid": True,

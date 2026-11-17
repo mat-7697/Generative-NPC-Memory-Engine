@@ -1,3 +1,4 @@
+import re
 from typing import List, Optional
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -12,6 +13,16 @@ from app.models.quest import (
 )
 
 router = APIRouter(tags=["Quests"])
+
+
+def _normalize_answer(text: str) -> str:
+    """Lenient comparison key: case-insensitive, ignores punctuation/spacing and a leading article.
+
+    "The Echo!", "an echo" and "ECHO" all normalize to "echo"; "Moon-Orchid" and "moon orchid" match.
+    """
+    text = text.strip().lower()
+    text = re.sub(r"^(the|an|a)\s+", "", text)
+    return re.sub(r"[^a-z0-9]", "", text)
 
 
 @router.get("/search", response_model=List[QuestResponse])
@@ -236,66 +247,28 @@ async def complete_quest(
             detail=f"Quest cannot be completed because its current status is '{quest['status']}'",
         )
 
-    # Validate challenge solution requirement
+    # Validate challenge solution requirement.
+    # challenge_answer may list several accepted answers separated by "|".
     expected_answer = (quest["challenge_answer"] or "").strip()
     if expected_answer:
-        provided = (payload.solution if payload else None) or ""
-        provided = provided.strip()
-        if not provided or provided.lower() != expected_answer.lower():
-            hint_str = f" Hint: {quest['challenge_hint']}" if quest.get("challenge_hint") else ""
+        provided = payload.submitted() if payload else ""
+        accepted = {_normalize_answer(a) for a in expected_answer.split("|") if a.strip()}
+        if not provided or _normalize_answer(provided) not in accepted:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Incorrect objective solution! Complete the quest challenge first.{hint_str}",
+                detail="Incorrect answer. Read the question again, or reveal the hint if you're stuck.",
             )
 
-    async with conn.transaction():
-        # Update quest status to completed
-        await conn.execute(
-            """
-            UPDATE player_quests
-            SET status = 'completed', completed_at = NOW()
-            WHERE player_quest_id = $1
-            """,
-            quest["player_quest_id"],
-        )
-
-        # Grant player gold and XP
-        await conn.execute(
-            """
-            UPDATE players
-            SET gold = gold + $1,
-                xp = xp + $2,
-                updated_at = NOW()
-            WHERE player_id = $3
-            """,
-            quest["reward_gold"],
-            quest["reward_xp"],
-            current_user.player_id,
-        )
-
-        # Grant reward item if present
-        if quest["reward_item_id"]:
-            await conn.execute(
-                """
-                INSERT INTO player_inventory (player_id, item_id, quantity, acquired_at)
-                VALUES ($1, $2, 1, NOW())
-                ON CONFLICT (player_id, item_id)
-                DO UPDATE SET quantity = player_inventory.quantity + 1
-                """,
-                current_user.player_id,
-                quest["reward_item_id"],
-            )
-
-            await conn.execute(
-                """
-                INSERT INTO inventory_transactions (
-                    player_id, item_id, transaction_type, quantity, gold_amount, description, created_at
-                ) VALUES ($1, $2, 'quest_reward', 1, 0, $3, NOW())
-                """,
-                current_user.player_id,
-                quest["reward_item_id"],
-                f"Quest reward for completing '{quest['title']}'",
-            )
+    # Gold, XP, reward item and ledger entry are granted by the
+    # trg_reward_quest_completion trigger when status flips to 'completed'.
+    await conn.execute(
+        """
+        UPDATE player_quests
+        SET status = 'completed', completed_at = NOW()
+        WHERE player_quest_id = $1
+        """,
+        quest["player_quest_id"],
+    )
 
     return {
         "detail": f"Quest '{quest['title']}' completed successfully!",

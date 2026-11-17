@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS player_inventory (
     player_id INTEGER NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
     item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
     quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity >= 0),
+    is_equipped BOOLEAN NOT NULL DEFAULT FALSE,
     acquired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(player_id, item_id)
 );
@@ -133,7 +134,7 @@ CREATE TABLE IF NOT EXISTS inventory_transactions (
     transaction_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     player_id INTEGER NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
     item_id INTEGER REFERENCES items(item_id) ON DELETE SET NULL,
-    transaction_type VARCHAR(20) NOT NULL CHECK (transaction_type IN ('buy', 'sell', 'transfer_in', 'transfer_out', 'quest_reward', 'admin_grant')),
+    transaction_type VARCHAR(20) NOT NULL CHECK (transaction_type IN ('buy', 'sell', 'transfer_in', 'transfer_out', 'quest_reward', 'admin_grant', 'consume_item')),
     quantity INTEGER NOT NULL CHECK (quantity > 0),
     gold_amount INTEGER NOT NULL DEFAULT 0,
     description TEXT,

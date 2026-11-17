@@ -211,7 +211,7 @@ export default function QuestsPage() {
               <button
                 onClick={() => handleResetProgress(false)}
                 disabled={resettingProgress}
-                className="py-1.5 px-3 rounded-xl bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-semibold border border-white/10 transition flex items-center gap-1.5"
+                className="py-1.5 px-3 rounded-xl bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-semibold border border-white/10 transition flex items-center gap-1.5 whitespace-nowrap"
                 title="Reset completed quests back to available so you can demonstrate solving them live"
               >
                 <span>🔄</span>
@@ -220,7 +220,7 @@ export default function QuestsPage() {
               <button
                 onClick={() => handleResetProgress(true)}
                 disabled={resettingProgress}
-                className="py-1.5 px-3 rounded-xl bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 text-xs font-semibold border border-purple-500/30 transition flex items-center gap-1.5"
+                className="py-1.5 px-3 rounded-xl bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 text-xs font-semibold border border-purple-500/30 transition flex items-center gap-1.5 whitespace-nowrap"
                 title="Reset player to Lv. 1 and clear quest logs for a full fresh playthrough demo"
               >
                 <span>🌱</span>
@@ -505,9 +505,7 @@ export default function QuestsPage() {
                 </div>
 
                 {/* NPC Dialogue Tip for CTF/Cipher quests */}
-                {(activeChallengeQuest.challenge_type?.toLowerCase().includes('npc') ||
-                  activeChallengeQuest.challenge_type?.toLowerCase().includes('cipher') ||
-                  activeChallengeQuest.title?.toLowerCase().includes('smuggler')) && (
+                {activeChallengeQuest.challenge_type?.toLowerCase().includes('npc') && (
                   <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-500/30 flex items-start gap-2.5 text-xs text-indigo-200">
                     <span className="text-base">💬</span>
                     <div>

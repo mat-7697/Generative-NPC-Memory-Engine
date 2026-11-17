@@ -25,7 +25,8 @@ async def list_items(
     """List merchant catalog items with optional PostgreSQL full-text search."""
     if query and query.strip():
         sql = """
-            SELECT item_id, name, description, base_price, item_type, rarity, stock
+            SELECT item_id, name, description, base_price, item_type, rarity, stock,
+                   attack_power, defense_power, heal_amount
             FROM items
             WHERE search_vector @@ plainto_tsquery('english', $1)
             ORDER BY ts_rank(search_vector, plainto_tsquery('english', $1)) DESC, name ASC
@@ -33,7 +34,8 @@ async def list_items(
         rows = await conn.fetch(sql, query.strip())
     else:
         sql = """
-            SELECT item_id, name, description, base_price, item_type, rarity, stock
+            SELECT item_id, name, description, base_price, item_type, rarity, stock,
+                   attack_power, defense_power, heal_amount
             FROM items
             ORDER BY item_id ASC
         """
@@ -58,6 +60,9 @@ async def get_my_inventory(
             i.base_price,
             i.item_type,
             i.rarity,
+            i.attack_power,
+            i.defense_power,
+            i.heal_amount,
             pi.quantity,
             COALESCE(pi.is_equipped, FALSE) AS is_equipped,
             pi.acquired_at
@@ -220,11 +225,17 @@ async def use_item(
     current_user: TokenData = Depends(get_current_user),
     conn: asyncpg.Connection = Depends(get_db),
 ):
-    """Use an item from player inventory: consume potions for XP/gold rewards, or toggle equip on weapons/armor."""
+    """Use an item: drink a potion to restore HP, or equip/unequip a weapon or armor piece.
+
+    Only one weapon and one armor piece can be equipped at a time; equipping a new
+    one automatically unequips the previous item of that type.
+    """
+    from app.routers.battle import max_hp_for
+
     inv_item = await conn.fetchrow(
         """
         SELECT pi.inventory_id, pi.quantity, COALESCE(pi.is_equipped, FALSE) AS is_equipped,
-               i.name, i.item_type, i.base_price, i.rarity
+               i.name, i.item_type, i.heal_amount
         FROM player_inventory pi
         JOIN items i ON pi.item_id = i.item_id
         WHERE pi.player_id = $1 AND pi.item_id = $2 AND pi.quantity > 0
@@ -242,8 +253,17 @@ async def use_item(
     item_name = inv_item["name"]
 
     if item_type == "potion":
-        # Consumable: decrement quantity (or remove row if 1)
         async with conn.transaction():
+            player = await conn.fetchrow(
+                "SELECT hp, level FROM players WHERE player_id = $1 FOR UPDATE", current_user.player_id
+            )
+            max_hp = max_hp_for(player["level"])
+            if player["hp"] >= max_hp:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="You are already at full health. Save the potion for battle!",
+                )
+            healed = min(inv_item["heal_amount"], max_hp - player["hp"])
             if inv_item["quantity"] > 1:
                 await conn.execute(
                     "UPDATE player_inventory SET quantity = quantity - 1 WHERE inventory_id = $1",
@@ -254,14 +274,9 @@ async def use_item(
                     "DELETE FROM player_inventory WHERE inventory_id = $1",
                     inv_item["inventory_id"],
                 )
-
-            xp_awarded = 100 if "Elixir" in item_name else 50
             await conn.execute(
-                "UPDATE players SET xp = xp + $1 WHERE player_id = $2",
-                xp_awarded,
-                current_user.player_id,
+                "UPDATE players SET hp = hp + $1 WHERE player_id = $2", healed, current_user.player_id
             )
-
             await conn.execute(
                 """
                 INSERT INTO inventory_transactions (
@@ -270,27 +285,44 @@ async def use_item(
                 """,
                 current_user.player_id,
                 request_data.item_id,
-                f"Consumed {item_name} (+{xp_awarded} XP)",
+                f"Drank {item_name} (+{healed} HP)",
             )
 
         return {
             "success": True,
             "action": "consumed",
-            "message": f"Consumed {item_name}! Awarded +{xp_awarded} XP.",
-            "xp_awarded": xp_awarded,
+            "message": f"Drank {item_name}: restored {healed} HP.",
+            "healed": healed,
         }
-    else:
-        # Equip/Unequip gear (weapon, armor, quest_item, misc)
-        new_equip_state = not inv_item["is_equipped"]
+
+    if item_type not in ("weapon", "armor"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This item can't be used directly. Quest items unlock hunting grounds; materials can be sold.",
+        )
+
+    new_equip_state = not inv_item["is_equipped"]
+    async with conn.transaction():
+        if new_equip_state:
+            # Unequip any other item of the same slot first.
+            await conn.execute(
+                """
+                UPDATE player_inventory pi SET is_equipped = FALSE
+                FROM items i
+                WHERE pi.item_id = i.item_id AND pi.player_id = $1 AND i.item_type = $2 AND pi.is_equipped
+                """,
+                current_user.player_id,
+                item_type,
+            )
         await conn.execute(
             "UPDATE player_inventory SET is_equipped = $1 WHERE inventory_id = $2",
             new_equip_state,
             inv_item["inventory_id"],
         )
-        verb = "Equipped" if new_equip_state else "Unequipped"
-        return {
-            "success": True,
-            "action": "equip_toggled",
-            "is_equipped": new_equip_state,
-            "message": f"{verb} {item_name} successfully!",
-        }
+    verb = "Equipped" if new_equip_state else "Unequipped"
+    return {
+        "success": True,
+        "action": "equip_toggled",
+        "is_equipped": new_equip_state,
+        "message": f"{verb} {item_name}.",
+    }

@@ -37,15 +37,14 @@ async def get_memory_stats(
     collection_name = settings.qdrant_collection
 
     is_admin = (current_user.role == "admin")
-    scroll_filter = None
-    if not is_admin:
-        scroll_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="player_id", match=models.MatchValue(value=current_user.player_id)
-                )
-            ]
-        )
+    own_filter = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="player_id", match=models.MatchValue(value=current_user.player_id)
+            )
+        ]
+    )
+    scroll_filter = None if is_admin else own_filter
 
     try:
         count_res = client.count(
@@ -54,6 +53,11 @@ async def get_memory_stats(
             exact=True,
         )
         total_memories = count_res.count
+        player_memories = (
+            client.count(collection_name=collection_name, count_filter=own_filter, exact=True).count
+            if is_admin
+            else total_memories
+        )
     except Exception:
         # Graceful fallback when Qdrant is offline or starting up
         return MemoryStats(
@@ -117,6 +121,7 @@ async def get_memory_stats(
 
     return MemoryStats(
         total_memories=total_memories,
+        player_memories=player_memories,
         by_npc=by_npc,
         by_player=by_player,
         recent=recent,
@@ -125,28 +130,60 @@ async def get_memory_stats(
 
 @router.get("/search", response_model=List[MemoryResponse])
 async def search_memories(
-    npc_id: int = Query(..., description="Target NPC ID to filter memories"),
-    query: str = Query(..., min_length=1, description="Semantic text query"),
+    npc_id: Optional[int] = Query(None, description="Target NPC ID to filter memories (all NPCs if omitted)"),
+    query: Optional[str] = Query(None, description="Semantic text query; omit to list most recent memories"),
     top_k: int = Query(5, ge=1, le=50, description="Number of results to retrieve"),
     current_user: TokenData = Depends(get_current_user),
 ):
-    """Semantic vector search across NPC dialogue memories with recency-weighted decay scoring."""
+    """Semantic vector search across NPC dialogue memories with recency-weighted decay scoring.
+
+    With no query, returns the player's most recent memories (no similarity score).
+    """
     settings = get_settings()
     client = get_qdrant_client()
     collection_name = settings.qdrant_collection
 
-    query_vec = embed_text(query)
+    conditions = [
+        models.FieldCondition(
+            key="player_id", match=models.MatchValue(value=current_user.player_id)
+        )
+    ]
+    if npc_id is not None:
+        conditions.append(
+            models.FieldCondition(key="npc_id", match=models.MatchValue(value=npc_id))
+        )
+    query_filter = models.Filter(must=conditions)
 
-    query_filter = models.Filter(
-        must=[
-            models.FieldCondition(
-                key="player_id", match=models.MatchValue(value=current_user.player_id)
-            ),
-            models.FieldCondition(
-                key="npc_id", match=models.MatchValue(value=npc_id)
-            ),
-        ]
-    )
+    if not query or not query.strip():
+        try:
+            points, _ = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=query_filter,
+                limit=500,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:
+            return []
+        recent = []
+        for pt in points:
+            p = pt.payload or {}
+            recent.append(
+                MemoryResponse(
+                    id=str(pt.id),
+                    player_id=int(p.get("player_id", current_user.player_id)),
+                    npc_id=int(p.get("npc_id", npc_id or 0)),
+                    text=p.get("text") or p.get("content", ""),
+                    role=p.get("role", "player"),
+                    importance=float(p.get("importance", 0.5)),
+                    timestamp=float(p.get("timestamp", 0.0)),
+                    score=None,
+                )
+            )
+        recent.sort(key=lambda m: m.timestamp or 0.0, reverse=True)
+        return recent[:top_k]
+
+    query_vec = embed_text(query)
 
     try:
         search_hits = client.search(
@@ -175,7 +212,7 @@ async def search_memories(
             MemoryResponse(
                 id=str(hit.id),
                 player_id=int(p.get("player_id", current_user.player_id)),
-                npc_id=int(p.get("npc_id", npc_id)),
+                npc_id=int(p.get("npc_id", npc_id or 0)),
                 text=p.get("text") or p.get("content", ""),
                 role=p.get("role", "player"),
                 importance=float(p.get("importance", 0.5)),

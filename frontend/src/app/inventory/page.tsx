@@ -40,6 +40,7 @@ export default function InventoryPage() {
 
       if (itemsRes.status === 'fulfilled') setShopItems(itemsRes.value || []);
       if (invRes.status === 'fulfilled') setMyInventory(invRes.value || []);
+      else toastError(invRes.reason?.message || 'Failed to load your vault.');
       if (txRes.status === 'fulfilled') setTransactions(txRes.value || []);
     } catch (err: any) {
       toastError(err.message || 'Failed to sync inventory and shop catalog.');
@@ -161,6 +162,37 @@ export default function InventoryPage() {
     }
   };
 
+  // What an item actually does in the game (shown on every card).
+  const getItemEffect = (item: {
+    item_type?: string;
+    attack_power?: number;
+    defense_power?: number;
+    heal_amount?: number;
+    name?: string;
+  }) => {
+    switch (item.item_type) {
+      case 'weapon':
+        return { text: `+${item.attack_power ?? 0} Attack`, tone: 'text-rose-300 bg-rose-500/10 border-rose-500/30' };
+      case 'armor':
+        return { text: `+${item.defense_power ?? 0} Defense`, tone: 'text-sky-300 bg-sky-500/10 border-sky-500/30' };
+      case 'potion':
+        return {
+          text:
+            (item.heal_amount ?? 0) >= 999
+              ? 'Full heal'
+              : `Heals ${item.heal_amount ?? 0} HP${item.name === 'Mana Draught' ? ' · 2x next hit' : ''}`,
+          tone: 'text-emerald-300 bg-emerald-500/10 border-emerald-500/30',
+        };
+      case 'quest_item':
+        return { text: 'Unlocks a hunting ground', tone: 'text-violet-300 bg-violet-500/10 border-violet-500/30' };
+      default:
+        return { text: 'Loot · sell for gold', tone: 'text-amber-300 bg-amber-500/10 border-amber-500/30' };
+    }
+  };
+
+  // Quest items are earned in the campaign, not bought.
+  const buyableItems = shopItems.filter((i) => i.item_type !== 'quest_item');
+
   const getItemIcon = (type: string = 'misc') => {
     switch (type) {
       case 'weapon':
@@ -225,7 +257,7 @@ export default function InventoryPage() {
               }`}
             >
               <span>🏪</span>
-              <span>Merchant Shop ({shopItems.length})</span>
+              <span>Merchant Shop ({buyableItems.length})</span>
             </button>
             <button
               onClick={() => setActiveTab('inventory')}
@@ -273,7 +305,7 @@ export default function InventoryPage() {
                   ></div>
                 ))}
               </div>
-            ) : shopItems.length === 0 ? (
+            ) : buyableItems.length === 0 ? (
               <div className="glass-card rounded-2xl p-12 text-center border border-white/10">
                 <div className="text-4xl mb-3">📦</div>
                 <h3 className="text-base font-bold text-slate-200">No items available</h3>
@@ -283,7 +315,7 @@ export default function InventoryPage() {
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {shopItems.map((item) => {
+                {buyableItems.map((item) => {
                   const canAfford = (user?.gold || 0) >= item.base_price;
                   const isInfinite = item.stock === -1;
                   const inStock = isInfinite || item.stock > 0;
@@ -312,6 +344,11 @@ export default function InventoryPage() {
 
                         {/* Title & Description */}
                         <h3 className="text-sm font-bold text-white mb-1">{item.name}</h3>
+                        <span
+                          className={`inline-block mb-2 px-2 py-0.5 rounded-md text-[11px] font-semibold border ${getItemEffect(item).tone}`}
+                        >
+                          {getItemEffect(item).text}
+                        </span>
                         <p className="text-xs text-slate-400 line-clamp-2 leading-relaxed mb-4">
                           {item.description || 'Standard fantasy adventure artifact.'}
                         </p>
@@ -410,6 +447,11 @@ export default function InventoryPage() {
                       <h3 className="text-sm font-bold text-white mb-1">
                         {item.name || `Item #${item.item_id}`}
                       </h3>
+                      <span
+                        className={`inline-block mb-2 px-2 py-0.5 rounded-md text-[11px] font-semibold border ${getItemEffect(item).tone}`}
+                      >
+                        {getItemEffect(item).text}
+                      </span>
                       <p className="text-xs text-slate-400 line-clamp-2 leading-relaxed mb-4">
                         {item.description || 'Equipped in player inventory.'}
                       </p>
@@ -418,6 +460,7 @@ export default function InventoryPage() {
                     {/* Actions: Use/Equip, Sell & Transfer */}
                     <div className="pt-3 border-t border-white/10 space-y-2">
                       {/* Primary Use / Equip Action */}
+                      {['weapon', 'armor', 'potion'].includes(item.item_type || '') ? (
                       <button
                         onClick={() => handleUse(item)}
                         disabled={actionLoading === `use-${item.item_id}`}
@@ -432,18 +475,23 @@ export default function InventoryPage() {
                         {actionLoading === `use-${item.item_id}` ? (
                           'Processing...'
                         ) : item.item_type === 'potion' ? (
-                          '🧪 Drink / Consume Potion'
+                          '🧪 Drink (restore HP)'
                         ) : item.is_equipped ? (
-                          '🛡️ Unequip Gear'
+                          'Unequip'
                         ) : (
-                          '⚔️ Equip to Active Slot'
+                          `Equip ${item.item_type === 'weapon' ? 'Weapon' : 'Armor'}`
                         )}
                       </button>
+                      ) : (
+                        <div className="w-full py-1.5 px-3 rounded-xl text-xs text-center text-slate-400 bg-white/[0.03] border border-white/10">
+                          {item.item_type === 'quest_item' ? 'Key item · see the Hunt page' : 'Sell this to the merchant'}
+                        </div>
+                      )}
 
                       <div className="flex items-center justify-between text-xs text-slate-400 pt-0.5">
                         <span>Sell Value:</span>
                         <span className="text-amber-300 font-bold">
-                          🪙 {Math.floor((item.base_price || 10) * 0.75)} G each
+                          🪙 {Math.max(1, Math.floor((item.base_price || 10) * 0.5))} G each
                         </span>
                       </div>
 
@@ -521,20 +569,21 @@ export default function InventoryPage() {
                               : 'bg-cyan-500/20 text-cyan-300'
                           }`}
                         >
-                          {tx.transaction_type}
+                          {tx.transaction_type.replace(/_/g, ' ')}
                         </span>
                       </td>
                       <td className="py-3 px-3 text-slate-200 font-mono">
                         {tx.quantity}x
                       </td>
                       <td className="py-3 px-3 font-mono">
-                        {tx.gold_amount > 0 ? (
-                          <span className="text-emerald-400 font-bold">
-                            +{tx.gold_amount} G
-                          </span>
-                        ) : tx.gold_amount < 0 ? (
+                        {tx.gold_amount !== 0 &&
+                        ['buy', 'inn_rest'].includes(tx.transaction_type) ? (
                           <span className="text-rose-400 font-bold">
-                            {tx.gold_amount} G
+                            -{Math.abs(tx.gold_amount)} G
+                          </span>
+                        ) : tx.gold_amount !== 0 ? (
+                          <span className="text-emerald-400 font-bold">
+                            +{Math.abs(tx.gold_amount)} G
                           </span>
                         ) : (
                           <span className="text-slate-400">0 G</span>

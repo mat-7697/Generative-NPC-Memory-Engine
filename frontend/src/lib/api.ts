@@ -4,7 +4,7 @@
  * Qdrant vector memory, authentication, and the interactive SQL Workbench.
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001';
 
 function getAuthHeader(): Record<string, string> {
   if (typeof window === 'undefined') return {};
@@ -112,6 +112,9 @@ export interface ItemResponse {
   item_type: ItemType;
   rarity: ItemRarity;
   stock: number;
+  attack_power?: number;
+  defense_power?: number;
+  heal_amount?: number;
   created_at?: string;
 }
 
@@ -180,6 +183,9 @@ export interface InventoryItem {
   base_price?: number;
   item_type?: ItemType;
   rarity?: ItemRarity;
+  attack_power?: number;
+  defense_power?: number;
+  heal_amount?: number;
   is_equipped?: boolean;
 }
 
@@ -348,13 +354,6 @@ export interface AuditLogResponse {
   changed_at: string;
 }
 
-export interface QueryPreset {
-  name: string;
-  category: string;
-  description: string;
-  query: string;
-}
-
 export interface SQLWorkbenchResult {
   success: boolean;
   mode?: 'read_only' | 'dml';
@@ -433,6 +432,76 @@ export interface DatabaseExplorerResponse {
 // ==============================================================================
 // API CONTROLLERS
 // ==============================================================================
+
+
+// ==============================================================================
+// COMBAT CAMPAIGN
+// ==============================================================================
+
+export interface GearSlot {
+  item_id: number;
+  name: string;
+  item_type: 'weapon' | 'armor';
+  attack_power: number;
+  defense_power: number;
+}
+
+export interface CombatPlayer {
+  player_id: number;
+  level: number;
+  xp: number;
+  gold: number;
+  hp: number;
+  max_hp: number;
+  attack: number;
+  defense: number;
+  weapon: GearSlot | null;
+  armor: GearSlot | null;
+}
+
+export interface Monster {
+  monster_id: number;
+  name: string;
+  region: string;
+  description: string;
+  icon: string;
+  min_level: number;
+  max_hp: number;
+  attack: number;
+  defense: number;
+  gold_reward: number;
+  xp_reward: number;
+  loot_item_name: string | null;
+  loot_chance: number;
+  is_boss: boolean;
+  required_item_name: string | null;
+  kills: number;
+  unlocked: boolean;
+  lock_reason: string | null;
+}
+
+export interface BattleState {
+  player: CombatPlayer;
+  monsters: Monster[];
+  active_battle: {
+    battle_id: number;
+    monster_id: number;
+    monster_hp: number;
+    empowered: boolean;
+    turns: number;
+    monster: Monster;
+  } | null;
+  potions: Array<{ item_id: number; name: string; heal_amount: number; quantity: number }>;
+  rest_cost: number;
+  rift_sealed: boolean;
+  regions_cleared: number;
+}
+
+export interface BattleActionResult {
+  log: string[];
+  outcome: 'ongoing' | 'won' | 'lost' | 'fled' | 'rested';
+  state: BattleState;
+}
 
 export const api = {
   // Authentication
@@ -515,6 +584,22 @@ export const api = {
   },
 
   // Quests
+  battle: {
+    getState: () => request<BattleState>('/api/battle/state'),
+    start: (monsterId: number) =>
+      request<BattleActionResult>('/api/battle/start', {
+        method: 'POST',
+        body: JSON.stringify({ monster_id: monsterId }),
+      }),
+    attack: () => request<BattleActionResult>('/api/battle/attack', { method: 'POST' }),
+    useItem: (itemId: number) =>
+      request<BattleActionResult>('/api/battle/use-item', {
+        method: 'POST',
+        body: JSON.stringify({ item_id: itemId }),
+      }),
+    flee: () => request<BattleActionResult>('/api/battle/flee', { method: 'POST' }),
+    rest: () => request<BattleActionResult>('/api/battle/rest', { method: 'POST' }),
+  },
   quests: {
     getAll: () => request<QuestResponse[]>('/api/quests/'),
     search: (query: string) =>
@@ -527,7 +612,7 @@ export const api = {
         `/api/quests/${questId}/complete`,
         {
           method: 'POST',
-          body: JSON.stringify({ answer: answer || '' }),
+          body: JSON.stringify({ solution: answer || '' }),
         }
       ),
     getPrerequisites: (questId: number) =>
@@ -617,11 +702,10 @@ export const api = {
       const q = playerId !== undefined ? `?player_id=${playerId}` : '';
       return request<QuestProgress[]>(`/api/admin/quest-progress${q}`);
     },
-    getQueryPresets: () => request<QueryPreset[]>('/api/admin/query-presets'),
-    executeSql: (query: string, mode: 'read_only' | 'dml' = 'read_only', confirmCommit = false) =>
+    executeSql: (query: string, dryRun = false) =>
       request<SQLWorkbenchResult>('/api/admin/sql-playground', {
         method: 'POST',
-        body: JSON.stringify({ query, mode, confirm_commit: confirmCommit }),
+        body: JSON.stringify({ query, dry_run: dryRun }),
       }),
     explainAnalyze: (query: string) =>
       request<ExplainAnalyzeResult>('/api/admin/explain-analyze', {

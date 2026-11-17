@@ -7,10 +7,11 @@ import { useAuth } from '@/lib/auth';
 
 const NAV_ITEMS = [
   { label: 'Dashboard', href: '/dashboard', icon: '⚡' },
-  { label: 'NPC Dialogue', href: '/chat', icon: '💬' },
-  { label: 'Market & Vault', href: '/inventory', icon: '🎒' },
-  { label: 'Quest Log', href: '/quests', icon: '📜' },
-  { label: 'Memory Core', href: '/memory', icon: '🧠' },
+  { label: 'Hunt', href: '/battle', icon: '⚔️' },
+  { label: 'Market', href: '/inventory', icon: '🎒' },
+  { label: 'Quests', href: '/quests', icon: '📜' },
+  { label: 'NPC Chat', href: '/chat', icon: '💬' },
+  { label: 'Memory', href: '/memory', icon: '🧠' },
 ];
 
 export default function Navbar() {
@@ -48,21 +49,21 @@ export default function Navbar() {
                 <span className="text-base font-extrabold tracking-wider bg-clip-text text-transparent bg-gradient-to-r from-violet-300 via-indigo-200 to-cyan-300">
                   GEN NPC
                 </span>
-                <span className="text-[10px] text-slate-400 tracking-widest font-mono uppercase">
+                <span className="text-[10px] text-slate-400 tracking-widest font-mono uppercase whitespace-nowrap">
                   Memory Engine
                 </span>
               </div>
             </Link>
 
             {/* Desktop Navigation Links */}
-            <nav className="hidden md:flex items-center gap-1 ml-6">
+            <nav className="hidden md:flex items-center gap-1 ml-4">
               {NAV_ITEMS.map((item) => {
                 const isActive = pathname === item.href;
                 return (
                   <Link
                     key={item.href}
                     href={item.href}
-                    className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-medium transition duration-150 ${
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition duration-150 ${
                       isActive
                         ? 'bg-violet-600/25 text-violet-300 border border-violet-500/40 shadow-sm shadow-violet-500/20'
                         : 'text-slate-300 hover:text-white hover:bg-white/5 border border-transparent'
@@ -78,21 +79,21 @@ export default function Navbar() {
               {user?.role === 'admin' && (
                 <Link
                   href="/admin"
-                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold tracking-wide transition duration-150 ${
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition duration-150 ${
                     pathname === '/admin'
                       ? 'bg-amber-500/20 text-amber-300 border border-amber-500/50 shadow-sm shadow-amber-500/20'
                       : 'text-amber-400/90 hover:text-amber-300 hover:bg-amber-500/10 border border-amber-500/20'
                   }`}
                 >
                   <span>🛡️</span>
-                  <span>Admin Hub</span>
+                  <span>Admin</span>
                 </Link>
               )}
             </nav>
           </div>
 
           {/* User Status Bar & Economy Pill */}
-          <div className="hidden lg:flex items-center gap-4">
+          <div className="hidden lg:flex items-center gap-3 whitespace-nowrap">
             {/* Gold Balance */}
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs font-bold shadow-sm shadow-amber-500/10">
               <span className="text-amber-400 text-sm">🪙</span>
@@ -104,12 +105,12 @@ export default function Navbar() {
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-medium">
               <span className="text-xs">⚔️</span>
               <span>Lv. {user?.level ?? 1}</span>
-              <span className="text-[10px] text-cyan-400/70">({user?.xp ?? 0} XP)</span>
+              <span className="hidden xl:inline text-[10px] text-cyan-400/70">{user?.xp ?? 0} XP</span>
             </div>
 
             {/* User Profile & Role */}
             <div className="flex items-center gap-3 pl-2 border-l border-white/10">
-              <div className="flex flex-col text-right">
+              <div className="hidden xl:flex flex-col text-right">
                 <span className="text-xs font-semibold text-slate-100 flex items-center justify-end gap-1.5">
                   {user?.username || 'Hero'}
                   {user?.role === 'admin' ? (

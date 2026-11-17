@@ -47,12 +47,6 @@ function LoginForm() {
     }
   };
 
-  const handleQuickFill = (u: string, p: string) => {
-    setUsername(u);
-    setPassword(p);
-    setErrorMessage(null);
-  };
-
   return (
     <div className="w-full max-w-md">
       {/* Main Card */}
@@ -122,29 +116,6 @@ function LoginForm() {
             )}
           </button>
         </form>
-
-        {/* Quick Credential Fill for Evaluation */}
-        <div className="mt-6 pt-5 border-t border-white/10">
-          <p className="text-[11px] text-slate-400 text-center mb-2.5 font-medium">
-            Demo Credentials (Click to prefill):
-          </p>
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              onClick={() => handleQuickFill('admin', 'admin123')}
-              className="px-2.5 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[11px] font-medium transition"
-            >
-              👑 Admin / admin123
-            </button>
-            <button
-              type="button"
-              onClick={() => handleQuickFill('hero', 'hero123')}
-              className="px-2.5 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 text-[11px] font-medium transition"
-            >
-              ⚔️ Hero / hero123
-            </button>
-          </div>
-        </div>
 
         <div className="mt-6 text-center text-xs text-slate-400">
           New adventurer?{' '}

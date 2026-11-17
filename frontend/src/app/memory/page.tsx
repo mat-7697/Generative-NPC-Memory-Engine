@@ -600,7 +600,7 @@ export default function MemoryPage() {
                             Imp: {importance.toFixed(1)}
                           </span>
 
-                          {score !== undefined && (
+                          {score != null && (
                             <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono">
                               Sim: {(Number(score) * 100).toFixed(0)}%
                             </span>

@@ -14,6 +14,7 @@ from app.database import close_db, get_pool, init_db
 from app.limiter import limiter
 from app.qdrant_client import init_qdrant
 from app.routers.admin import router as admin_router
+from app.routers.battle import router as battle_router
 from app.routers.chat import router as chat_router
 from app.routers.inventory import router as inventory_router
 from app.routers.memory import router as memory_router
@@ -86,6 +87,7 @@ app.include_router(quests_router, prefix="/api/quests")
 app.include_router(memory_router, prefix="/api/memory")
 app.include_router(chat_router, prefix="/api/chat")
 app.include_router(admin_router, prefix="/api/admin")
+app.include_router(battle_router, prefix="/api/battle")
 
 
 @app.get("/api/health", tags=["Health"])

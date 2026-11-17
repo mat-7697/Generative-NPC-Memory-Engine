@@ -28,13 +28,12 @@ import {
   RoutineSchema,
   SQLWorkbenchResult,
   ExplainAnalyzeResult,
-  QueryPreset,
 } from '@/lib/api';
 
 type AdminTab = 'stats' | 'players' | 'npcs' | 'items' | 'quests' | 'audit' | 'sql';
 
 export default function AdminPage() {
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const { success, error: toastError, info } = useToast();
 
   const [activeTab, setActiveTab] = useState<AdminTab>('stats');
@@ -48,11 +47,8 @@ export default function AdminPage() {
   const [explainResult, setExplainResult] = useState<ExplainAnalyzeResult | null>(null);
   const [executingSql, setExecutingSql] = useState(false);
   const [explainingSql, setExplainingSql] = useState(false);
-  const [queryPresets, setQueryPresets] = useState<QueryPreset[]>([]);
   const [sqlViewMode, setSqlViewMode] = useState<'table' | 'explain'>('table');
-  const [sqlMode, setSqlMode] = useState<'read_only' | 'dml'>('read_only');
-  const [confirmCommit, setConfirmCommit] = useState(false);
-  const [selectedPresetCategory, setSelectedPresetCategory] = useState<string>('All');
+  const [dryRun, setDryRun] = useState(false);
 
   // Database Explorer state
   const [dbExplorer, setDbExplorer] = useState<DatabaseExplorerResponse | null>(null);
@@ -324,17 +320,14 @@ export default function AdminPage() {
     }
   }, [toastError]);
 
-  // Load Query Presets and DB Explorer when entering SQL tab
+  // Load the DB Explorer when entering the SQL tab
   useEffect(() => {
     if (activeTab === 'sql') {
-      if (queryPresets.length === 0) {
-        api.admin.getQueryPresets().then(setQueryPresets).catch(() => {});
-      }
       if (!dbExplorer && !loadingExplorer) {
         loadDbExplorer();
       }
     }
-  }, [activeTab, queryPresets.length, dbExplorer, loadingExplorer, loadDbExplorer]);
+  }, [activeTab, dbExplorer, loadingExplorer, loadDbExplorer]);
 
   const handleExportCsv = () => {
     if (!sqlResult || !sqlResult.columns || !sqlResult.rows || sqlResult.rows.length === 0) {
@@ -370,17 +363,16 @@ export default function AdminPage() {
     setSqlViewMode('table');
     setExplainResult(null);
     try {
-      const res = await api.admin.executeSql(sqlQuery, sqlMode, confirmCommit);
+      const res = await api.admin.executeSql(sqlQuery, dryRun);
       setSqlResult(res);
       if (!res.success) {
         toastError(res.error || 'Query failed to execute');
       } else {
-        const modeDesc =
-          sqlMode === 'dml'
-            ? confirmCommit
-              ? 'Committed DML'
-              : 'Preview / Rollback DML'
-            : 'Read-Only';
+        if (res.committed) {
+          // Reflect the change everywhere: navbar gold/level, admin tables, explorer row counts.
+          await Promise.allSettled([refreshUser(), loadData(), loadDbExplorer()]);
+        }
+        const modeDesc = res.committed ? 'Committed' : res.rolled_back ? 'Dry run, rolled back' : 'Read-only';
         const affected = res.affected_rows !== undefined ? `, ${res.affected_rows} affected` : '';
         success(
           `[${modeDesc}] Executed in ${res.execution_time_ms} ms (${res.row_count} rows${affected})`
@@ -548,9 +540,9 @@ export default function AdminPage() {
                       No quest progress data found.
                     </div>
                   ) : (
-                    questProgress.map((qp) => (
+                    questProgress.map((qp, qpIdx) => (
                       <div
-                        key={qp.quest_id}
+                        key={`qp-${qp.quest_id}-${qpIdx}`}
                         className="p-3 rounded-xl bg-white/[0.03] border border-white/5 flex items-center justify-between text-xs"
                       >
                         <div>
@@ -964,7 +956,7 @@ export default function AdminPage() {
         {/* TAB 7: SQL CONSOLE & WORKBENCH */}
         {activeTab === 'sql' && (
           <div className="space-y-6">
-            {/* Top Info Banner for Viva */}
+            {/* Top Info Banner */}
             <div className="glass-card p-5 rounded-2xl border border-cyan-500/30 bg-cyan-950/20">
               <div className="flex items-start gap-3">
                 <span className="text-2xl">🎓</span>
@@ -979,82 +971,6 @@ export default function AdminPage() {
                     Interactive SQL console connected to PostgreSQL (<code className="bg-black/50 px-1.5 py-0.5 rounded text-amber-300 font-mono text-[11px]">npc_memory_engine</code>). Execute real queries, benchmark query plans with <strong className="text-cyan-400">EXPLAIN (ANALYZE, BUFFERS)</strong>, inspect schema with the Database Explorer, or test transaction rollback/commit modes.
                   </p>
                 </div>
-              </div>
-            </div>
-
-            {/* Presets Bar with 12 Viva Categories */}
-            <div className="glass-card p-4 rounded-2xl border border-white/10 space-y-3">
-              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
-                <span className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-                  <span>📚</span>
-                  <span>Curated Viva Query Presets ({queryPresets.length}):</span>
-                </span>
-                <span className="text-[11px] text-slate-400">
-                  Select a category or click any query below to populate the editor
-                </span>
-              </div>
-
-              {/* Category Filter Pills */}
-              <div className="flex flex-wrap gap-1.5 pb-1">
-                {[
-                  'All',
-                  'Basic SQL',
-                  'Joins',
-                  'Aggregations',
-                  'Subqueries',
-                  'CTE and Recursive CTE',
-                  'Window Functions',
-                  'Views',
-                  'Stored Procedures',
-                  'Triggers',
-                  'Indexing and Query Optimization',
-                  'Full-Text Search',
-                  'DML Operations',
-                ].map((cat) => (
-                  <button
-                    key={cat}
-                    type="button"
-                    onClick={() => setSelectedPresetCategory(cat)}
-                    className={`px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase transition ${
-                      selectedPresetCategory === cat
-                        ? 'bg-cyan-500 text-black shadow-md shadow-cyan-500/20'
-                        : 'bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white'
-                    }`}
-                  >
-                    {cat}
-                  </button>
-                ))}
-              </div>
-
-              {/* Presets Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-1 max-h-60 overflow-y-auto pr-1">
-                {(selectedPresetCategory === 'All'
-                  ? queryPresets
-                  : queryPresets.filter((p) => p.category === selectedPresetCategory)
-                ).map((preset, idx) => (
-                  <button
-                    key={idx}
-                    type="button"
-                    onClick={() => {
-                      setSqlQuery(preset.query);
-                      setSqlResult(null);
-                      setExplainResult(null);
-                    }}
-                    className="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/10 text-left transition group"
-                  >
-                    <div className="flex items-center justify-between text-[11px] mb-1">
-                      <span className="font-bold text-white group-hover:text-cyan-300 transition">
-                        {preset.name}
-                      </span>
-                      <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
-                        {preset.category}
-                      </span>
-                    </div>
-                    <p className="text-[10px] text-slate-400 line-clamp-2 leading-relaxed">
-                      {preset.description}
-                    </p>
-                  </button>
-                ))}
               </div>
             </div>
 
@@ -1223,9 +1139,9 @@ export default function AdminPage() {
                               .filter((r) =>
                                 r.name.toLowerCase().includes(explorerSearch.toLowerCase())
                               )
-                              .map((routine) => (
+                              .map((routine, rtIdx) => (
                                 <div
-                                  key={routine.name}
+                                  key={`rt-${routine.name}-${rtIdx}`}
                                   className="p-2 rounded-lg border border-white/5 bg-white/[0.02] flex items-center justify-between text-xs font-mono"
                                 >
                                   <div className="flex items-center gap-1.5 text-emerald-300 text-[11px] truncate">
@@ -1255,35 +1171,20 @@ export default function AdminPage() {
                       <span>PostgreSQL Query Editor:</span>
                     </span>
 
-                    {/* Mode Toggle Pills */}
+                    {/* Dry-run toggle: writes commit immediately unless this is ticked */}
                     <div className="flex items-center gap-2">
-                      <div className="flex items-center p-0.5 bg-black/50 rounded-xl border border-white/10 text-[11px]">
-                        <button
-                          type="button"
-                          onClick={() => setSqlMode('read_only')}
-                          className={`px-3 py-1 rounded-lg font-bold transition flex items-center gap-1 ${
-                            sqlMode === 'read_only'
-                              ? 'bg-cyan-500 text-black shadow-sm'
-                              : 'text-slate-400 hover:text-white'
-                          }`}
-                        >
-                          <span>🛡️</span>
-                          <span>Read-Only Mode</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setSqlMode('dml')}
-                          className={`px-3 py-1 rounded-lg font-bold transition flex items-center gap-1 ${
-                            sqlMode === 'dml'
-                              ? 'bg-amber-500 text-black shadow-sm'
-                              : 'text-slate-400 hover:text-white'
-                          }`}
-                        >
-                          <span>✏️</span>
-                          <span>DML Mode</span>
-                        </button>
-                      </div>
-
+                      <label
+                        className="flex items-center gap-2 cursor-pointer text-[11px] font-semibold text-slate-300 bg-black/40 px-3 py-1.5 rounded-lg border border-white/10"
+                        title="Run INSERT/UPDATE/DELETE inside a transaction and roll it back"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={dryRun}
+                          onChange={(e) => setDryRun(e.target.checked)}
+                          className="rounded border-amber-400 text-amber-500 focus:ring-0"
+                        />
+                        <span>Dry run (rollback)</span>
+                      </label>
                       <button
                         type="button"
                         onClick={() => setSqlQuery('')}
@@ -1294,37 +1195,25 @@ export default function AdminPage() {
                     </div>
                   </div>
 
-                  {/* DML Mode Confirmation / Safeguard Banner */}
-                  {sqlMode === 'dml' && (
-                    <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-xs text-amber-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-                      <div className="flex items-center gap-2">
-                        <span className="text-base">⚠️</span>
-                        <div>
-                          <strong className="text-white">DML Demonstration Mode:</strong>{' '}
-                          {confirmCommit ? (
-                            <span className="text-rose-300 font-bold">
-                              CHANGES WILL BE COMMITTED TO THE DATABASE!
-                            </span>
-                          ) : (
-                            <span>
-                              Changes are executed in an isolated transaction and{' '}
-                              <strong className="text-amber-300">AUTOMATICALLY ROLLED BACK</strong>{' '}
-                              for preview safety.
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-white bg-black/40 px-3 py-1.5 rounded-lg border border-amber-500/40 shrink-0">
-                        <input
-                          type="checkbox"
-                          checked={confirmCommit}
-                          onChange={(e) => setConfirmCommit(e.target.checked)}
-                          className="rounded border-amber-400 text-amber-500 focus:ring-0"
-                        />
-                        <span>Confirm Commit</span>
-                      </label>
-                    </div>
-                  )}
+                  {/* Execution behaviour hint */}
+                  <div
+                    className={`px-3 py-2 rounded-xl text-[11px] border ${
+                      dryRun
+                        ? 'bg-amber-950/30 border-amber-500/30 text-amber-200'
+                        : 'bg-emerald-950/20 border-emerald-500/20 text-emerald-200'
+                    }`}
+                  >
+                    {dryRun ? (
+                      <span>
+                        <strong>Dry run:</strong> INSERT / UPDATE / DELETE run inside a transaction and are rolled back. Nothing is saved.
+                      </span>
+                    ) : (
+                      <span>
+                        <strong>Live:</strong> SELECT runs read-only. INSERT / UPDATE / DELETE / CALL are committed
+                        immediately and show up across the app. UPDATE / DELETE need a WHERE clause.
+                      </span>
+                    )}
+                  </div>
 
                   {/* Query Textarea */}
                   <textarea
@@ -1369,10 +1258,8 @@ export default function AdminPage() {
                         onClick={handleRunSql}
                         disabled={executingSql || explainingSql || !sqlQuery.trim()}
                         className={`py-2 px-5 rounded-xl text-white text-xs font-bold shadow-lg transition flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${
-                          sqlMode === 'dml'
-                            ? confirmCommit
-                              ? 'bg-rose-600 hover:bg-rose-500 shadow-rose-600/20'
-                              : 'bg-amber-600 hover:bg-amber-500 shadow-amber-600/20'
+                          dryRun
+                            ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-600/20'
                             : 'bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 shadow-cyan-600/20'
                         }`}
                       >
@@ -1380,10 +1267,8 @@ export default function AdminPage() {
                         <span>
                           {executingSql
                             ? 'Executing...'
-                            : sqlMode === 'dml'
-                            ? confirmCommit
-                              ? 'Commit DML'
-                              : 'Preview DML'
+                            : dryRun
+                            ? 'Run (dry run)'
                             : 'Run Query'}
                         </span>
                       </button>

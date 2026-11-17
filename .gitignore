@@ -57,6 +57,7 @@ out/
 
 # Database & Vector Store
 qdrant_storage/
+qdrant_local_data/
 *.sqlite
 *.sqlite3
 *.db

@@ -436,9 +436,9 @@ export default function ChatPage() {
                       ) : (
                         <div className="space-y-1">
                           {Object.entries(selectedNpc.personality_traits).map(([k, v]) => (
-                            <div key={k} className="flex justify-between">
-                              <span className="capitalize text-slate-400">{k}:</span>
-                              <span className="font-mono text-cyan-300">{String(v)}</span>
+                            <div key={k} className="flex justify-between gap-3">
+                              <span className="capitalize text-slate-400 shrink-0">{k}:</span>
+                              <span className="font-mono text-cyan-300 text-right break-words min-w-0">{String(v)}</span>
                             </div>
                           ))}
                         </div>

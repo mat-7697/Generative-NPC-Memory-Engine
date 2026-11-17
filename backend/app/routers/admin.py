@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from datetime import date, datetime
 from decimal import Decimal
@@ -499,7 +500,8 @@ async def get_quest_progress(
 class SQLPlaygroundRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=10000, description="SQL query to execute")
     mode: str = Field("read_only", pattern="^(read_only|dml)$", description="Execution mode: read_only or dml")
-    confirm_commit: bool = Field(False, description="Require explicit confirmation before committing DML changes")
+    confirm_commit: bool = Field(False, description="Deprecated: DML now commits by default")
+    dry_run: bool = Field(False, description="Execute DML then roll it back (preview only)")
 
 
 class _RollbackPreviewException(Exception):
@@ -573,145 +575,95 @@ async def execute_sql_playground(
             detail=f"Destructive DDL operations ({info.get('first_keyword')}) are restricted on the live database. Use dedicated schema reset scripts (db/reset.sql) instead.",
         )
 
+    is_write = bool(info.get("is_dml") or info.get("has_mutation"))
+
+    # Safeguard 4: UPDATE / DELETE must target specific rows (no accidental full-table wipe).
+    keyword = (info.get("first_keyword") or "").upper()
+    if keyword in ("UPDATE", "DELETE") and not re.search(r"\bWHERE\b", clean_query, re.IGNORECASE):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{keyword} without a WHERE clause is blocked to protect the live database. Add a WHERE condition.",
+        )
+
     start_time = time.perf_counter()
 
-    try:
-        # ----------------------------------------------------------------------
-        # MODE 1: READ-ONLY MODE (Default)
-        # ----------------------------------------------------------------------
-        if payload.mode == "read_only":
-            if info.get("is_dml") or info.get("has_mutation"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Data mutations (INSERT, UPDATE, DELETE) are restricted in Read-Only Mode. Switch to 'DML Demonstration Mode' in the workbench toolbar.",
-                )
+    def _format(rows):
+        columns = list(rows[0].keys()) if rows else []
+        formatted = [{col: _sanitize_cell(row[col]) for col in columns} for row in rows]
+        return columns, redact_sensitive_columns(columns, formatted)
 
-            # Enforce read-only at PostgreSQL transaction engine level
+    try:
+        # ------------------------------------------------------------------
+        # Reads (SELECT / WITH / EXPLAIN ...) run in a READ ONLY transaction.
+        # ------------------------------------------------------------------
+        if not is_write:
             async with conn.transaction(readonly=True):
                 await conn.execute("SET LOCAL statement_timeout = '5000ms'")
                 rows = await conn.fetch(clean_query)
-
-            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            if rows:
-                columns = list(rows[0].keys())
-                formatted_rows = [
-                    {col: _sanitize_cell(row[col]) for col in columns}
-                    for row in rows
-                ]
-                # Redact sensitive credentials (e.g. password_hash)
-                formatted_rows = redact_sensitive_columns(columns, formatted_rows)
-            else:
-                columns = []
-                formatted_rows = []
-
+            columns, formatted_rows = _format(rows)
             return {
                 "success": True,
                 "mode": "read_only",
                 "command": info.get("first_keyword", "SELECT"),
-                "execution_time_ms": duration_ms,
+                "execution_time_ms": round((time.perf_counter() - start_time) * 1000, 2),
                 "row_count": len(formatted_rows),
                 "columns": columns,
                 "rows": formatted_rows[:500],
             }
 
-        # ----------------------------------------------------------------------
-        # MODE 2: DML DEMONSTRATION MODE (Preview/Rollback vs Explicit Commit)
-        # ----------------------------------------------------------------------
-        else:
-            if not (info.get("is_dml") or info.get("has_mutation")):
-                # If user ran a SELECT query in DML mode, execute it safely
-                async with conn.transaction(readonly=True):
-                    await conn.execute("SET LOCAL statement_timeout = '5000ms'")
-                    rows = await conn.fetch(clean_query)
-                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-                columns = list(rows[0].keys()) if rows else []
-                formatted_rows = [
-                    {col: _sanitize_cell(row[col]) for col in columns}
-                    for row in rows
-                ]
-                formatted_rows = redact_sensitive_columns(columns, formatted_rows)
+        # ------------------------------------------------------------------
+        # Writes (INSERT / UPDATE / DELETE / CALL) are COMMITTED immediately,
+        # unless dry_run is set, in which case they are rolled back.
+        # ------------------------------------------------------------------
+        async def _run_write():
+            await conn.execute("SET LOCAL statement_timeout = '5000ms'")
+            if "RETURNING" in clean_query.upper():
+                rows = await conn.fetch(clean_query)
+                columns, formatted = _format(rows)
+                return len(rows), columns, formatted
+            status_res = await conn.execute(clean_query)
+            return _parse_affected_rows(status_res), [], []
+
+        if payload.dry_run:
+            try:
+                async with conn.transaction():
+                    row_count, columns, formatted_rows = await _run_write()
+                    raise _RollbackPreviewException(row_count, columns, formatted_rows)
+            except _RollbackPreviewException as exc:
                 return {
                     "success": True,
                     "mode": "dml",
-                    "command": info.get("first_keyword", "SELECT"),
-                    "execution_time_ms": duration_ms,
-                    "row_count": len(formatted_rows),
-                    "columns": columns,
-                    "rows": formatted_rows[:500],
+                    "command": info.get("first_keyword", "DML"),
+                    "rolled_back": True,
+                    "committed": False,
+                    "transaction_status": "ROLLED_BACK (DRY RUN)",
+                    "status": "ROLLBACK_PREVIEW",
+                    "message": f"Dry run: {exc.row_count} row(s) would be affected. Transaction rolled back, nothing was saved.",
+                    "execution_time_ms": round((time.perf_counter() - start_time) * 1000, 2),
+                    "affected_rows": exc.row_count,
+                    "row_count": exc.row_count,
+                    "columns": exc.columns,
+                    "rows": exc.rows[:500],
                 }
 
-            # If user hasn't explicitly confirmed commit: ROLLBACK PREVIEW MODE
-            if not payload.confirm_commit:
-                try:
-                    async with conn.transaction():
-                        await conn.execute("SET LOCAL statement_timeout = '5000ms'")
-                        if "RETURNING" in clean_query.upper():
-                            rows = await conn.fetch(clean_query)
-                            row_count = len(rows)
-                            columns = list(rows[0].keys()) if rows else []
-                            formatted_rows = [
-                                {col: _sanitize_cell(row[col]) for col in columns}
-                                for row in rows
-                            ]
-                            formatted_rows = redact_sensitive_columns(columns, formatted_rows)
-                        else:
-                            status_res = await conn.execute(clean_query)
-                            row_count = _parse_affected_rows(status_res)
-                            columns = []
-                            formatted_rows = []
-                        raise _RollbackPreviewException(row_count, columns, formatted_rows)
-                except _RollbackPreviewException as exc:
-                    duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-                    return {
-                        "success": True,
-                        "mode": "dml",
-                        "command": info.get("first_keyword", "DML"),
-                        "rolled_back": True,
-                        "committed": False,
-                        "transaction_status": "ROLLED_BACK (PREVIEW)",
-                        "status": "ROLLBACK_PREVIEW",
-                        "message": f"DML executed in preview mode and safely rolled back ({exc.row_count} rows affected). No permanent changes were written to PostgreSQL.",
-                        "execution_time_ms": duration_ms,
-                        "affected_rows": exc.row_count,
-                        "row_count": exc.row_count,
-                        "columns": exc.columns,
-                        "rows": exc.rows[:500],
-                    }
+        async with conn.transaction():
+            row_count, columns, formatted_rows = await _run_write()
 
-            # Explicit Confirmation Given: COMMIT MODE
-            async with conn.transaction():
-                await conn.execute("SET LOCAL statement_timeout = '5000ms'")
-                if "RETURNING" in clean_query.upper():
-                    rows = await conn.fetch(clean_query)
-                    row_count = len(rows)
-                    columns = list(rows[0].keys()) if rows else []
-                    formatted_rows = [
-                        {col: _sanitize_cell(row[col]) for col in columns}
-                        for row in rows
-                    ]
-                    formatted_rows = redact_sensitive_columns(columns, formatted_rows)
-                else:
-                    status_res = await conn.execute(clean_query)
-                    row_count = _parse_affected_rows(status_res)
-                    columns = []
-                    formatted_rows = []
-
-            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            return {
-                "success": True,
-                "mode": "dml",
-                "command": info.get("first_keyword", "DML"),
-                "committed": True,
-                "rolled_back": False,
-                "transaction_status": "COMMITTED",
-                "status": "COMMITTED",
-                "message": f"DML transaction committed successfully ({row_count} rows affected).",
-                "execution_time_ms": duration_ms,
-                "affected_rows": row_count,
-                "row_count": row_count,
-                "columns": columns,
-                "rows": formatted_rows[:500],
-            }
+        return {
+            "success": True,
+            "mode": "dml",
+            "command": info.get("first_keyword", "DML"),
+            "committed": True,
+            "rolled_back": False,
+            "transaction_status": "COMMITTED",
+            "status": "COMMITTED",
+            "message": f"{info.get('first_keyword', 'DML')} committed: {row_count} row(s) affected. Changes are live.",
+            "execution_time_ms": round((time.perf_counter() - start_time) * 1000, 2),
+            "affected_rows": row_count,
+            "row_count": row_count,
+            "columns": columns,
+            "rows": formatted_rows[:500],
+        }
 
     except asyncpg.PostgresError as err:
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -900,421 +852,3 @@ async def get_database_explorer(conn: asyncpg.Connection = Depends(get_db)):
         "views": views,
         "routines": routines,
     }
-
-
-@router.get("/query-presets")
-async def get_query_presets():
-    """Curated viva and DBMS syllabus query presets covering all 12 evaluation categories."""
-    return [
-        # 1. Basic SQL
-        {
-            "name": "1. Player Wealth Filter & Sort",
-            "category": "Basic SQL",
-            "description": "Demonstrates SELECT, WHERE filter on numeric values, and ORDER BY with LIMIT.",
-            "query": """SELECT player_id, username, level, gold, xp
-FROM players
-WHERE gold >= 100
-ORDER BY gold DESC, level DESC
-LIMIT 5;""",
-        },
-        {
-            "name": "2. Distinct Rarity & Item Type Catalog",
-            "category": "Basic SQL",
-            "description": "Demonstrates SELECT DISTINCT to eliminate duplicate category tuples.",
-            "query": """SELECT DISTINCT item_type, rarity
-FROM items
-ORDER BY item_type, rarity;""",
-        },
-        {
-            "name": "3. Price Range & Set Membership (BETWEEN & IN)",
-            "category": "Basic SQL",
-            "description": "Demonstrates BETWEEN range matching and IN set inclusion operator.",
-            "query": """SELECT name, item_type, rarity, base_price, stock
-FROM items
-WHERE base_price BETWEEN 40 AND 500
-  AND item_type IN ('weapon', 'armor', 'potion')
-ORDER BY base_price ASC;""",
-        },
-        {
-            "name": "4. Wildcard Substring Pattern (LIKE)",
-            "category": "Basic SQL",
-            "description": "Demonstrates pattern matching using SQL LIKE with wildcard character %.",
-            "query": """SELECT quest_id, title, min_level, reward_gold, reward_xp
-FROM quests
-WHERE title LIKE '%Secret%' OR description LIKE '%cellar%'
-ORDER BY min_level ASC;""",
-        },
-
-        # 2. Joins
-        {
-            "name": "5. Multi-Table Valuation JOIN",
-            "category": "Joins",
-            "description": "3-table INNER JOIN across players, player_inventory, and items computing valuations.",
-            "query": """SELECT 
-    p.player_id,
-    p.username,
-    i.name AS item_name,
-    i.rarity,
-    pi.quantity,
-    i.base_price AS unit_price,
-    (pi.quantity * i.base_price) AS line_item_value
-FROM players p
-JOIN player_inventory pi ON p.player_id = pi.player_id
-JOIN items i ON pi.item_id = i.item_id
-ORDER BY line_item_value DESC;""",
-        },
-        {
-            "name": "6. Outer LEFT JOIN with COALESCE",
-            "category": "Joins",
-            "description": "LEFT JOIN preserving unmatched starter quests, resolving prerequisite titles.",
-            "query": """SELECT 
-    q.quest_id,
-    q.title AS quest_title,
-    q.min_level,
-    qp.required_quest_id,
-    COALESCE(rq.title, 'None (Starter Quest)') AS prerequisite_title
-FROM quests q
-LEFT JOIN quest_prerequisites qp ON q.quest_id = qp.quest_id
-LEFT JOIN quests rq ON qp.required_quest_id = rq.quest_id
-ORDER BY q.quest_id ASC;""",
-        },
-        {
-            "name": "7. RIGHT JOIN: Unowned Item Inventory Gaps",
-            "category": "Joins",
-            "description": "RIGHT JOIN identifying catalog items not currently possessed by any player.",
-            "query": """SELECT 
-    i.item_id,
-    i.name AS catalog_item,
-    i.rarity,
-    i.base_price,
-    pi.player_id,
-    pi.quantity
-FROM player_inventory pi
-RIGHT JOIN items i ON pi.item_id = i.item_id
-WHERE pi.player_id IS NULL
-ORDER BY i.base_price DESC;""",
-        },
-        {
-            "name": "8. FULL OUTER JOIN: Players & Quest Statuses",
-            "category": "Joins",
-            "description": "FULL OUTER JOIN retaining non-participating players and unattempted quests.",
-            "query": """SELECT 
-    p.username,
-    COALESCE(pq.status, 'unassigned') AS player_status,
-    q.title AS quest_title
-FROM players p
-FULL OUTER JOIN player_quests pq ON p.player_id = pq.player_id
-FULL OUTER JOIN quests q ON pq.quest_id = q.quest_id
-LIMIT 20;""",
-        },
-        {
-            "name": "9. Self Join: Prerequisite Dependency Pairs",
-            "category": "Joins",
-            "description": "Self-join on quests table to link each quest directly to its requirement title.",
-            "query": """SELECT 
-    q.quest_id,
-    q.title AS quest_title,
-    req.quest_id AS prerequisite_id,
-    req.title AS prerequisite_title
-FROM quests q
-JOIN quest_prerequisites qp ON q.quest_id = qp.quest_id
-JOIN quests req ON qp.required_quest_id = req.quest_id
-ORDER BY q.quest_id ASC;""",
-        },
-
-        # 3. Aggregations
-        {
-            "name": "10. GROUP BY + HAVING: Active Traders",
-            "category": "Aggregations",
-            "description": "Groups player items, filtering players holding 2+ distinct types using HAVING.",
-            "query": """SELECT 
-    p.player_id,
-    p.username,
-    COUNT(pi.item_id) AS distinct_item_types,
-    SUM(pi.quantity) AS total_item_units,
-    SUM(pi.quantity * i.base_price) AS aggregate_valuation
-FROM players p
-JOIN player_inventory pi ON p.player_id = pi.player_id
-JOIN items i ON pi.item_id = i.item_id
-GROUP BY p.player_id, p.username
-HAVING COUNT(pi.item_id) >= 2
-ORDER BY aggregate_valuation DESC;""",
-        },
-        {
-            "name": "11. Category Statistics: Price & Stock Summary",
-            "category": "Aggregations",
-            "description": "Computes COUNT, MIN, MAX, AVG price, and total stock per item category.",
-            "query": """SELECT 
-    item_type,
-    COUNT(*) AS total_items,
-    MIN(base_price) AS minimum_price,
-    ROUND(AVG(base_price), 2) AS average_price,
-    MAX(base_price) AS maximum_price,
-    SUM(CASE WHEN stock > 0 THEN stock ELSE 0 END) AS tracked_inventory_units
-FROM items
-GROUP BY item_type
-ORDER BY average_price DESC;""",
-        },
-
-        # 4. Subqueries
-        {
-            "name": "12. Non-Correlated Subquery: Above Average Items",
-            "category": "Subqueries",
-            "description": "Subquery inside WHERE comparing individual item prices against catalog average.",
-            "query": """SELECT item_id, name, item_type, rarity, base_price
-FROM items
-WHERE base_price > (SELECT AVG(base_price) FROM items)
-ORDER BY base_price DESC;""",
-        },
-        {
-            "name": "13. Correlated Subquery: Wealthiest at Level",
-            "category": "Subqueries",
-            "description": "Correlated subquery evaluating if a player has more gold than the average of their level peers.",
-            "query": """SELECT p.player_id, p.username, p.level, p.gold
-FROM players p
-WHERE p.gold >= (
-    SELECT COALESCE(AVG(p2.gold), 0)
-    FROM players p2
-    WHERE p2.level = p.level
-)
-ORDER BY p.level DESC;""",
-        },
-        {
-            "name": "14. EXISTS Subquery: Completed Quest Players",
-            "category": "Subqueries",
-            "description": "EXISTS condition testing for presence of completed player_quests records.",
-            "query": """SELECT p.player_id, p.username, p.level, p.gold
-FROM players p
-WHERE EXISTS (
-    SELECT 1
-    FROM player_quests pq
-    WHERE pq.player_id = p.player_id AND pq.status = 'completed'
-)
-ORDER BY p.player_id ASC;""",
-        },
-        {
-            "name": "15. Set Operators: UNION, INTERSECT, EXCEPT",
-            "category": "Subqueries",
-            "description": "Demonstrates set difference (EXCEPT) between Quest 1 completions and Quest 4 starts.",
-            "query": """SELECT player_id, 'Completed Quest 1' AS reason
-FROM player_quests
-WHERE quest_id = 1 AND status = 'completed'
-EXCEPT
-SELECT player_id, 'Completed Quest 1' AS reason
-FROM player_quests
-WHERE quest_id = 4;""",
-        },
-
-        # 5. CTE and Recursive CTE
-        {
-            "name": "16. Common Table Expression (CTE): Net Worth",
-            "category": "CTE and Recursive CTE",
-            "description": "Encapsulates player wealth calculation in a clean WITH clause before final selection.",
-            "query": """WITH player_wealth AS (
-    SELECT 
-        p.player_id,
-        p.username,
-        p.gold,
-        COALESCE(SUM(pi.quantity * i.base_price), 0) AS inventory_worth
-    FROM players p
-    LEFT JOIN player_inventory pi ON p.player_id = pi.player_id
-    LEFT JOIN items i ON pi.item_id = i.item_id
-    GROUP BY p.player_id, p.username, p.gold
-)
-SELECT player_id, username, gold, inventory_worth, (gold + inventory_worth) AS total_player_wealth
-FROM player_wealth
-ORDER BY total_player_wealth DESC;""",
-        },
-        {
-            "name": "17. WITH RECURSIVE: Prerequisite DAG Hierarchy",
-            "category": "CTE and Recursive CTE",
-            "description": "Recursive graph traversal walking the quest prerequisite chain backwards from Quest #8.",
-            "query": """WITH RECURSIVE quest_prereq_chain AS (
-    SELECT 
-        quest_id,
-        title,
-        min_level,
-        0 AS depth,
-        title::text AS traversal_path
-    FROM quests
-    WHERE quest_id = 8
-    UNION ALL
-    SELECT 
-        q.quest_id,
-        q.title,
-        q.min_level,
-        c.depth + 1,
-        c.traversal_path || ' -> ' || q.title
-    FROM quest_prerequisites qp
-    JOIN quest_prereq_chain c ON qp.quest_id = c.quest_id
-    JOIN quests q ON qp.required_quest_id = q.quest_id
-)
-SELECT depth, quest_id, title, min_level, traversal_path
-FROM quest_prereq_chain
-ORDER BY depth ASC;""",
-        },
-
-        # 6. Window Functions
-        {
-            "name": "18. DENSE_RANK, RANK, & ROW_NUMBER Leaderboard",
-            "category": "Window Functions",
-            "description": "Demonstrates window ranking functions side-by-side without collapsing rows.",
-            "query": """SELECT 
-    player_id,
-    username,
-    level,
-    xp,
-    gold,
-    ROW_NUMBER() OVER (ORDER BY level DESC, xp DESC) AS row_num,
-    RANK() OVER (ORDER BY level DESC) AS level_rank,
-    DENSE_RANK() OVER (ORDER BY level DESC) AS dense_level_rank,
-    DENSE_RANK() OVER (ORDER BY gold DESC) AS wealth_rank
-FROM players
-ORDER BY row_num ASC;""",
-        },
-        {
-            "name": "19. Running Total & Partitioned Wealth",
-            "category": "Window Functions",
-            "description": "Cumulative running balance using SUM() OVER (PARTITION BY ... ORDER BY ...).",
-            "query": """SELECT 
-    transaction_id,
-    player_id,
-    transaction_type,
-    quantity,
-    gold_amount,
-    created_at,
-    SUM(gold_amount) OVER (
-        PARTITION BY player_id
-        ORDER BY created_at ASC
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS running_gold_volume
-FROM inventory_transactions
-ORDER BY player_id ASC, created_at ASC;""",
-        },
-
-        # 7. Views
-        {
-            "name": "20. Query player_leaderboard View",
-            "category": "Views",
-            "description": "Queries relational view aggregating completed quests, total items, and DENSE_RANK standings.",
-            "query": """SELECT leaderboard_rank, username, level, xp, gold, quest_completion_count, total_items_owned
-FROM player_leaderboard
-ORDER BY leaderboard_rank ASC;""",
-        },
-        {
-            "name": "21. Query npc_popularity Sentiment View",
-            "category": "Views",
-            "description": "Queries relational view calculating interaction frequencies, average affinity, and ranks.",
-            "query": """SELECT popularity_rank, npc_name, location, total_unique_players, total_interaction_count, avg_affinity_score
-FROM npc_popularity
-ORDER BY popularity_rank ASC;""",
-        },
-        {
-            "name": "22. Query quest_progress Cross-Matrix View",
-            "category": "Views",
-            "description": "Queries view evaluating transitive prerequisites and eligibility via can_start_quest().",
-            "query": """SELECT username, player_level, quest_title, min_level, status, reward_gold, reward_xp, prerequisites_met
-FROM quest_progress
-WHERE player_id = 2
-ORDER BY min_level ASC;""",
-        },
-
-        # 8. Stored Procedures
-        {
-            "name": "23. Call can_start_quest() Function",
-            "category": "Stored Procedures",
-            "description": "Executes stored PL/pgSQL function checking level gate and all prerequisite quests.",
-            "query": """SELECT 
-    p.username,
-    q.title AS quest_title,
-    q.min_level,
-    can_start_quest(p.player_id, q.quest_id) AS is_eligible
-FROM players p
-CROSS JOIN quests q
-WHERE p.player_id = 2 AND q.quest_id IN (1, 4, 8)
-ORDER BY q.quest_id ASC;""",
-        },
-        {
-            "name": "24. ACID Procedure: buy_item Demonstration",
-            "category": "Stored Procedures",
-            "description": "Invokes ACID stored procedure buy_item with row locks, solvency validation, and audit entry.",
-            "query": """CALL buy_item(2, 5, 1);""",
-        },
-
-        # 9. Triggers
-        {
-            "name": "25. Change Data Capture (CDC) Audit Trigger Log",
-            "category": "Triggers",
-            "description": "Inspects entries recorded automatically by triggers on player_inventory and players.",
-            "query": """SELECT log_id, table_name, operation, row_id, old_data, new_data, changed_by, changed_at
-FROM audit_log
-ORDER BY changed_at DESC
-LIMIT 10;""",
-        },
-        {
-            "name": "26. Invariant Trigger: Negative Gold Blocker",
-            "category": "Triggers",
-            "description": "Demonstrates fn_block_negative_gold trigger aborting transaction on negative balance.",
-            "query": """UPDATE players SET gold = -50 WHERE player_id = 2;""",
-        },
-
-        # 10. Indexing and Query Optimization
-        {
-            "name": "27. EXPLAIN ANALYZE on Foreign Key B-Tree",
-            "category": "Indexing and Query Optimization",
-            "description": "Benchmarks execution plan, index scan vs seq scan, buffer hits, and optimizer costs.",
-            "query": """SELECT * FROM player_inventory WHERE player_id = 2;""",
-        },
-        {
-            "name": "28. EXPLAIN ANALYZE on GIN Full-Text Search",
-            "category": "Indexing and Query Optimization",
-            "description": "Benchmarks GIN index lookup on tsvector column compared against unindexed LIKE scanning.",
-            "query": """SELECT item_id, name, base_price, description
-FROM items
-WHERE search_vector @@ to_tsquery('english', 'sword | blade');""",
-        },
-
-        # 11. Full-Text Search
-        {
-            "name": "29. GIN tsvector @@ to_tsquery with ts_rank",
-            "category": "Full-Text Search",
-            "description": "Matches items matching English linguistic stems and ranks by relevance score.",
-            "query": """SELECT 
-    item_id,
-    name,
-    item_type,
-    rarity,
-    base_price,
-    ts_rank(search_vector, to_tsquery('english', 'elixir | potion | draught')) AS relevance_rank
-FROM items
-WHERE search_vector @@ to_tsquery('english', 'elixir | potion | draught')
-ORDER BY relevance_rank DESC, base_price ASC;""",
-        },
-
-        # 12. DML Operations
-        {
-            "name": "30. Controlled DML: INSERT with RETURNING",
-            "category": "DML Operations",
-            "description": "Inserts a new catalog item. In DML Preview Mode, changes are safely previewed and rolled back.",
-            "query": """INSERT INTO items (name, description, base_price, item_type, rarity, stock)
-VALUES ('Astral Sextant', 'Ancient navigation instrument tuned to ley-line harmonics.', 420, 'misc', 'rare', 3)
-RETURNING item_id, name, base_price, rarity, stock;""",
-        },
-        {
-            "name": "31. Controlled DML: UPDATE with RETURNING",
-            "category": "DML Operations",
-            "description": "Updates gold treasury balance. Previews affected rows in Preview Mode or commits on confirmation.",
-            "query": """UPDATE players
-SET gold = gold + 250
-WHERE player_id = 2
-RETURNING player_id, username, gold, updated_at;""",
-        },
-        {
-            "name": "32. Controlled DML: DELETE with RETURNING",
-            "category": "DML Operations",
-            "description": "Removes a specific inventory entry and returns the deleted record.",
-            "query": """DELETE FROM player_inventory
-WHERE player_id = 1 AND item_id = 2
-RETURNING inventory_id, player_id, item_id, quantity;""",
-        },
-    ]

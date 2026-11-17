@@ -11,6 +11,8 @@ import {
   MemoryStats,
   InventoryItem,
   PlayerQuestResponse,
+  BattleState,
+  NPCResponse,
 } from '@/lib/api';
 
 export default function DashboardPage() {
@@ -21,6 +23,8 @@ export default function DashboardPage() {
   const [memoryStats, setMemoryStats] = useState<MemoryStats | null>(null);
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [quests, setQuests] = useState<PlayerQuestResponse[]>([]);
+  const [campaign, setCampaign] = useState<BattleState | null>(null);
+  const [npcs, setNpcs] = useState<NPCResponse[]>([]);
   const [loading, setLoading] = useState(true);
   const [showVivaTour, setShowVivaTour] = useState(false);
   const [tourStep, setTourStep] = useState(0);
@@ -83,13 +87,17 @@ export default function DashboardPage() {
       setLoading(true);
       await refreshUser();
 
-      const [lbRes, txRes, memRes, invRes, qRes] = await Promise.allSettled([
+      const [lbRes, txRes, memRes, invRes, qRes, campRes, npcRes] = await Promise.allSettled([
         api.players.getLeaderboard(),
         api.inventory.getTransactions(),
         api.memory.getStats(),
         api.inventory.getMyInventory(),
         api.quests.getMyQuests(),
+        api.battle.getState(),
+        api.npcs.getAll(),
       ]);
+      if (campRes.status === 'fulfilled') setCampaign(campRes.value);
+      if (npcRes.status === 'fulfilled') setNpcs(npcRes.value || []);
 
       if (lbRes.status === 'fulfilled') setLeaderboard(lbRes.value || []);
       if (txRes.status === 'fulfilled') setTransactions(txRes.value || []);
@@ -109,6 +117,26 @@ export default function DashboardPage() {
   const totalItemsOwned = inventory.reduce((acc, curr) => acc + (curr.quantity || 1), 0);
   const activeQuestsCount = quests.filter((q) => q.status === 'active').length;
   const completedQuestsCount = quests.filter((q) => q.status === 'completed').length;
+
+  // Campaign: next objective = first unlocked region not yet conquered, else the next lock to break.
+  const nextTarget = campaign?.monsters.find((m) => m.unlocked && m.kills === 0);
+  const nextLocked = campaign?.monsters.find((m) => !m.unlocked);
+  const nextObjective = campaign?.rift_sealed
+    ? 'The Void Rift is sealed. Keep hunting to grow stronger and top the leaderboard.'
+    : nextTarget
+      ? `Defeat the ${nextTarget.name} in the ${nextTarget.region}.`
+      : nextLocked
+        ? `${nextLocked.lock_reason} to reach the ${nextLocked.region}.`
+        : 'Hunt monsters to grow stronger.';
+
+  // Real per-NPC memory distribution (replaces placeholder bars).
+  const memoryByNpc = (memoryStats?.by_npc || [])
+    .map((row) => ({
+      name: npcs.find((n) => n.npc_id === row.npc_id)?.name || `NPC #${row.npc_id}`,
+      count: row.count,
+    }))
+    .sort((a, b) => b.count - a.count);
+  const memoryTotal = memoryByNpc.reduce((acc, r) => acc + r.count, 0);
 
   return (
     <ProtectedRoute>
@@ -223,68 +251,64 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Quick Hub Navigation Cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <Link
-            href="/chat"
-            className="glass-card p-4 rounded-xl border border-white/5 hover:border-violet-500/40 hover:bg-violet-950/20 transition group flex items-center gap-3.5"
-          >
-            <div className="w-10 h-10 rounded-lg bg-violet-600/20 border border-violet-500/30 flex items-center justify-center text-xl group-hover:scale-110 transition">
-              💬
+        {/* Campaign Card: the game's main goal */}
+        {campaign && (
+          <div className="glass-card rounded-2xl p-6 border border-rose-500/20 grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
+            <div className="md:col-span-2 min-w-0">
+              <div className="text-xs font-mono uppercase tracking-widest text-rose-300">Main Campaign · Seal the Void Rift</div>
+              <h2 className="mt-1 text-lg font-bold text-white">Next objective</h2>
+              <p className="text-sm text-slate-300 mt-0.5">{nextObjective}</p>
+              <div className="mt-4 grid grid-cols-2 gap-4 max-w-md">
+                <div>
+                  <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                    <span>Health</span>
+                    <span className="text-slate-200">
+                      {campaign.player.hp} / {campaign.player.max_hp}
+                    </span>
+                  </div>
+                  <div className="h-2 rounded-full bg-white/5 overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-500 rounded-full"
+                      style={{ width: `${(campaign.player.hp / campaign.player.max_hp) * 100}%` }}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                    <span>Regions conquered</span>
+                    <span className="text-slate-200">
+                      {campaign.regions_cleared} / {campaign.monsters.length}
+                    </span>
+                  </div>
+                  <div className="h-2 rounded-full bg-white/5 overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-violet-500 to-rose-500 rounded-full"
+                      style={{ width: `${(campaign.regions_cleared / campaign.monsters.length) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
             </div>
-            <div>
-              <h4 className="text-xs font-bold text-slate-200 group-hover:text-violet-300">
-                NPC Dialogue
-              </h4>
-              <p className="text-[11px] text-slate-400">Real-time semantic chat & memory</p>
+            <div className="flex md:flex-col gap-3 md:items-stretch">
+              <div className="flex-1 grid grid-cols-2 gap-2 text-center">
+                <div className="rounded-xl bg-white/[0.03] border border-white/10 py-2">
+                  <div className="text-[11px] text-slate-400">Attack</div>
+                  <div className="text-lg font-bold text-rose-300">{campaign.player.attack}</div>
+                </div>
+                <div className="rounded-xl bg-white/[0.03] border border-white/10 py-2">
+                  <div className="text-[11px] text-slate-400">Defense</div>
+                  <div className="text-lg font-bold text-sky-300">{campaign.player.defense}</div>
+                </div>
+              </div>
+              <Link
+                href="/battle"
+                className="flex-1 md:flex-none text-center px-4 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-sm font-semibold transition"
+              >
+                {campaign.active_battle ? 'Return to battle' : 'Go hunting'} →
+              </Link>
             </div>
-          </Link>
-
-          <Link
-            href="/inventory"
-            className="glass-card p-4 rounded-xl border border-white/5 hover:border-amber-500/40 hover:bg-amber-950/20 transition group flex items-center gap-3.5"
-          >
-            <div className="w-10 h-10 rounded-lg bg-amber-600/20 border border-amber-500/30 flex items-center justify-center text-xl group-hover:scale-110 transition">
-              ⚖️
-            </div>
-            <div>
-              <h4 className="text-xs font-bold text-slate-200 group-hover:text-amber-300">
-                Merchant Market
-              </h4>
-              <p className="text-[11px] text-slate-400">Buy, sell & peer item transfers</p>
-            </div>
-          </Link>
-
-          <Link
-            href="/quests"
-            className="glass-card p-4 rounded-xl border border-white/5 hover:border-emerald-500/40 hover:bg-emerald-950/20 transition group flex items-center gap-3.5"
-          >
-            <div className="w-10 h-10 rounded-lg bg-emerald-600/20 border border-emerald-500/30 flex items-center justify-center text-xl group-hover:scale-110 transition">
-              🗺️
-            </div>
-            <div>
-              <h4 className="text-xs font-bold text-slate-200 group-hover:text-emerald-300">
-                Quest Graph
-              </h4>
-              <p className="text-[11px] text-slate-400">Recursive prerequisite tree</p>
-            </div>
-          </Link>
-
-          <Link
-            href="/memory"
-            className="glass-card p-4 rounded-xl border border-white/5 hover:border-cyan-500/40 hover:bg-cyan-950/20 transition group flex items-center gap-3.5"
-          >
-            <div className="w-10 h-10 rounded-lg bg-cyan-600/20 border border-cyan-500/30 flex items-center justify-center text-xl group-hover:scale-110 transition">
-              🧠
-            </div>
-            <div>
-              <h4 className="text-xs font-bold text-slate-200 group-hover:text-cyan-300">
-                Memory Core
-              </h4>
-              <p className="text-[11px] text-slate-400">Vector search & knowledge graph</p>
-            </div>
-          </Link>
-        </div>
+          </div>
+        )}
 
         {/* Center Section: Leaderboard + Memory Stats */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -392,7 +416,7 @@ export default function DashboardPage() {
                     Total Qdrant Vectors
                   </div>
                   <div className="text-2xl font-black text-white mt-1">
-                    {memoryStats?.total_memories ?? memoryStats?.total_count ?? 24}
+                    {memoryStats?.total_memories ?? memoryStats?.total_count ?? 0}
                   </div>
                   <p className="text-[10px] text-slate-400 mt-1">
                     Cosine distance index • 384 dimensions
@@ -405,38 +429,31 @@ export default function DashboardPage() {
                     Episodic Load by Entity:
                   </div>
 
-                  {/* Elder Thorne */}
-                  <div>
-                    <div className="flex justify-between text-[11px] text-slate-400 mb-1">
-                      <span>Elder Thorne (Village Sage)</span>
-                      <span className="text-violet-300">45%</span>
-                    </div>
-                    <div className="w-full bg-white/5 rounded-full h-2 overflow-hidden">
-                      <div className="bg-gradient-to-r from-violet-600 to-indigo-500 h-2 rounded-full w-[45%]"></div>
-                    </div>
-                  </div>
-
-                  {/* Kaelen the Blacksmith */}
-                  <div>
-                    <div className="flex justify-between text-[11px] text-slate-400 mb-1">
-                      <span>Kaelen (Master Blacksmith)</span>
-                      <span className="text-cyan-300">35%</span>
-                    </div>
-                    <div className="w-full bg-white/5 rounded-full h-2 overflow-hidden">
-                      <div className="bg-gradient-to-r from-cyan-500 to-blue-500 h-2 rounded-full w-[35%]"></div>
-                    </div>
-                  </div>
-
-                  {/* Lyra the Alchemist */}
-                  <div>
-                    <div className="flex justify-between text-[11px] text-slate-400 mb-1">
-                      <span>Lyra (Herbalist & Alchemist)</span>
-                      <span className="text-amber-300">20%</span>
-                    </div>
-                    <div className="w-full bg-white/5 rounded-full h-2 overflow-hidden">
-                      <div className="bg-gradient-to-r from-amber-500 to-rose-500 h-2 rounded-full w-[20%]"></div>
-                    </div>
-                  </div>
+                  {memoryByNpc.length === 0 ? (
+                    <p className="text-[11px] text-slate-500">
+                      No memories yet. Chat with an NPC to create some.
+                    </p>
+                  ) : (
+                    memoryByNpc.slice(0, 5).map((row) => {
+                      const pct = Math.round((row.count / memoryTotal) * 100);
+                      return (
+                        <div key={row.name}>
+                          <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                            <span className="truncate">{row.name}</span>
+                            <span className="text-violet-300 shrink-0 ml-2">
+                              {row.count} · {pct}%
+                            </span>
+                          </div>
+                          <div className="w-full bg-white/5 rounded-full h-2 overflow-hidden">
+                            <div
+                              className="bg-gradient-to-r from-violet-600 to-cyan-500 h-2 rounded-full"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
                 </div>
               </div>
             </div>
@@ -506,20 +523,21 @@ export default function DashboardPage() {
                               : 'bg-violet-500/20 text-violet-300 border border-violet-500/30'
                           }`}
                         >
-                          {tx.transaction_type.replace('_', ' ')}
+                          {tx.transaction_type.replace(/_/g, ' ')}
                         </span>
                       </td>
                       <td className="py-3 px-3 text-slate-200 font-mono">
                         {tx.quantity}x
                       </td>
                       <td className="py-3 px-3 font-mono">
-                        {tx.gold_amount > 0 ? (
-                          <span className="text-emerald-400 font-bold">
-                            +{tx.gold_amount} G
-                          </span>
-                        ) : tx.gold_amount < 0 ? (
+                        {tx.gold_amount !== 0 &&
+                        ['buy', 'inn_rest'].includes(tx.transaction_type) ? (
                           <span className="text-rose-400 font-bold">
-                            {tx.gold_amount} G
+                            -{Math.abs(tx.gold_amount)} G
+                          </span>
+                        ) : tx.gold_amount !== 0 ? (
+                          <span className="text-emerald-400 font-bold">
+                            +{Math.abs(tx.gold_amount)} G
                           </span>
                         ) : (
                           <span className="text-slate-400">0 G</span>

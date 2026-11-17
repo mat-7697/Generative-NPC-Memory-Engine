@@ -33,6 +33,7 @@ class MemorySearch(BaseModel):
 
 class MemoryStats(BaseModel):
     total_memories: int
+    player_memories: int = 0  # memories belonging to the requesting player
     by_npc: List[Dict[str, Any]] = Field(default_factory=list)
     by_player: List[Dict[str, Any]] = Field(default_factory=list)
     recent: List[Dict[str, Any]] = Field(default_factory=list)
