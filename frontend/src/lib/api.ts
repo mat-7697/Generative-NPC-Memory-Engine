@@ -4,7 +4,7 @@
  * Qdrant vector memory, authentication, and the interactive SQL Workbench.
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 function getAuthHeader(): Record<string, string> {
   if (typeof window === 'undefined') return {};
@@ -274,9 +274,16 @@ export interface UpdateMemoryRequest {
   importance?: number;
 }
 
+export interface ChatTurn {
+  role: 'player' | 'npc';
+  text: string;
+}
+
 export interface ChatRequest {
   npc_id: number;
   message: string;
+  /** Recent on-screen dialogue, oldest first (max 20). */
+  history?: ChatTurn[];
 }
 
 export interface ChatResponse {
@@ -285,6 +292,84 @@ export interface ChatResponse {
   memories_used: MemoryResponse[];
   game_state?: Record<string, unknown>;
   affinity_change?: number;
+  /** Gemini model that wrote the reply, or "mock" for the offline fallback. */
+  source?: string;
+  /** False when long-term memory (Qdrant) was unavailable for this turn. */
+  memory_online?: boolean;
+}
+
+export interface ChatStreamHandlers {
+  onMeta?: (meta: { npc_name: string; memories_used: MemoryResponse[]; memory_online: boolean }) => void;
+  onDelta: (text: string) => void;
+}
+
+/**
+ * Stream an NPC reply over Server-Sent Events. `onDelta` fires for each piece of
+ * text as Gemini produces it; the promise resolves with the final ChatResponse.
+ */
+async function streamChat(
+  data: ChatRequest,
+  handlers: ChatStreamHandlers,
+  signal?: AbortSignal
+): Promise<ChatResponse> {
+  const response = await fetch(`${API_BASE}/api/chat/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+    body: JSON.stringify(data),
+    signal,
+  });
+  if (!response.ok || !response.body) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || `Request failed with status ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let npcName = '';
+  let memories: MemoryResponse[] = [];
+  let memoryOnline = true;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let sep: number;
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const raw = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      let event = 'message';
+      let payload = '';
+      for (const line of raw.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) payload += line.slice(5).trim();
+      }
+      if (!payload) continue;
+      const parsed = JSON.parse(payload);
+      if (event === 'meta') {
+        npcName = parsed.npc_name;
+        memories = parsed.memories_used || [];
+        memoryOnline = parsed.memory_online !== false;
+        handlers.onMeta?.(parsed);
+      } else if (event === 'delta') {
+        handlers.onDelta(parsed.text);
+      } else if (event === 'error') {
+        throw new Error(parsed.detail || 'Chat stream failed');
+      } else if (event === 'done') {
+        return {
+          reply: parsed.reply,
+          npc_name: npcName,
+          memories_used: memories,
+          game_state: parsed.game_state,
+          affinity_change: parsed.affinity_change,
+          source: parsed.source,
+          memory_online: memoryOnline,
+        };
+      }
+    }
+  }
+  throw new Error('Chat stream ended unexpectedly');
 }
 
 export interface LeaderboardEntry {
@@ -658,6 +743,7 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(data),
       }),
+    stream: streamChat,
   },
 
   // Administrative Hub & Interactive SQL Workbench

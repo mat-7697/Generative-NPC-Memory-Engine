@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import ProtectedRoute from '@/components/ProtectedRoute';
+import NpcChatWidget from '@/components/NpcChatWidget';
 import { useAuth } from '@/lib/auth';
 import { useToast } from '@/lib/toast';
 import {
@@ -1825,6 +1826,7 @@ export default function AdminPage() {
           </div>
         )}
       </div>
+      <NpcChatWidget />
     </ProtectedRoute>
   );
 }

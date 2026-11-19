@@ -268,7 +268,11 @@ export default function InventoryPage() {
               }`}
             >
               <span>🎒</span>
-              <span>My Vault ({myInventory.length})</span>
+              <span
+                title={`${myInventory.length} different item${myInventory.length === 1 ? '' : 's'}`}
+              >
+                My Vault ({myInventory.reduce((sum, i) => sum + (i.quantity || 0), 0)})
+              </span>
             </button>
           </div>
 

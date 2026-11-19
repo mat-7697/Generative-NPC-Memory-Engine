@@ -200,6 +200,61 @@ def search_memories(
     return scored_memories[:top_k]
 
 
+def get_recent_dialogue(
+    client: QdrantClient, player_id: int, npc_id: int, max_messages: int = 10
+) -> List[Dict[str, Any]]:
+    """Return the most recent dialogue lines between this player and NPC, oldest first.
+
+    Semantic search finds *relevant* memories; this supplies the *recent* back-and-forth
+    so the NPC can follow the conversation and avoid repeating itself.
+    """
+    settings = get_settings()
+    scroll_filter = models.Filter(
+        must=[
+            models.FieldCondition(key="player_id", match=models.MatchValue(value=player_id)),
+            models.FieldCondition(key="npc_id", match=models.MatchValue(value=npc_id)),
+        ]
+    )
+    try:
+        records, _ = client.scroll(
+            collection_name=settings.qdrant_collection,
+            scroll_filter=scroll_filter,
+            limit=500,
+            with_payload=True,
+            with_vectors=False,
+        )
+    except Exception as exc:
+        logger.warning("Could not load recent dialogue from Qdrant: %s", exc)
+        return []
+
+    lines = []
+    for rec in records:
+        payload = rec.payload or {}
+        text = (payload.get("text") or payload.get("content") or "").strip()
+        if not text:
+            continue
+        lines.append({
+            "id": str(rec.id),
+            "role": "npc" if payload.get("role") == "npc" else "player",
+            "text": text,
+            "timestamp": float(payload.get("timestamp", 0.0)),
+        })
+    lines.sort(key=lambda m: m["timestamp"])
+    return lines[-max_messages:]
+
+
+def _attitude_guidance(affinity: float) -> str:
+    if affinity >= 50.0:
+        return "You trust this person deeply: be warm, open, share secrets and favours freely."
+    if affinity >= 15.0:
+        return "You like this person: be friendly and a little more forthcoming than with strangers."
+    if affinity <= -50.0:
+        return "You despise this person: be cold, curt and unhelpful, though never break character."
+    if affinity <= -15.0:
+        return "You're wary of this person: be guarded, short and slow to share anything useful."
+    return "You don't know this person well yet: be civil but reserved, true to your nature."
+
+
 def build_prompt(
     npc: Dict[str, Any],
     game_state: Dict[str, Any],
@@ -213,17 +268,28 @@ def build_prompt(
     traits = npc.get("personality_traits", {})
 
     traits_desc = ", ".join(f"{k}: {v}" for k, v in traits.items()) if isinstance(traits, dict) and traits else "adaptable"
+    affinity = float(game_state.get("relationship", {}).get("affinity_score", 0.0) or 0.0)
 
     system_prompt = (
-        f"You are {npc_name}, located in {location}.\n"
-        f"Character Persona: {persona}\n"
-        f"Personality Traits: {traits_desc}\n\n"
-        f"Dialogue Directives:\n"
-        f"- Maintain your persona naturally without breaking character.\n"
-        f"- Reference previous memories, player items, and active quests where relevant.\n"
-        f"- Special Quest Intel: If the player asks about an active quest, challenge, or secret (such as smuggler ciphers, blast furnace ratios, or cellar dire rats), provide helpful in-character guidance and clues.\n"
-        f"- Acknowledge completed quests when relevant to praise the player's renown in the realm.\n"
-        f"- Respond directly in conversation without robotic prefixes."
+        f"You are {npc_name}, a living character in a fantasy world, currently at {location}.\n"
+        f"Who you are: {persona}\n"
+        f"Personality traits: {traits_desc}\n"
+        f"Attitude toward the player: {_attitude_guidance(affinity)}\n\n"
+        "How to talk:\n"
+        "- Respond to exactly what the player just said. React to it first (feelings, opinions, a "
+        "question back) before adding anything new. Never answer with a generic speech.\n"
+        "- Sound like a real person with your own voice, quirks and opinions - not a narrator or quest-giver.\n"
+        "- Vary how you open every reply. Never reuse a catchphrase, sound effect or opening you have "
+        "already used earlier in this conversation (e.g. don't start each reply with the same '*action*').\n"
+        "- If the player tells you their name, call them by it from then on. If they share something "
+        "personal (a fear, a goal, a loss), remember it and treat it with the emotion your character would.\n"
+        "- Ask the player a question now and then to keep the conversation going.\n"
+        "- Mention the player's items, quests or past memories only when it naturally fits - don't list them.\n"
+        "- If the player asks about an active quest, challenge or secret (smuggler ciphers, blast furnace "
+        "ratios, cellar dire rats...), give helpful in-character clues.\n"
+        "- If asked about things that don't exist in your world (phones, the internet, real countries), "
+        "react with in-character confusion rather than breaking character.\n"
+        "- Speak only as yourself, in plain dialogue. No prefixes like your name or 'NPC:'."
     )
 
     # Build Context
@@ -274,7 +340,8 @@ def build_prompt(
         attitude = "Neutral"
 
     context_lines = [
-        f"Player Character: {username} (Level: {level}, Gold: {gold})",
+        f"Player Character: {username} (account name; prefer any name they introduce themselves with) "
+        f"(Level: {level}, Gold: {gold})",
         f"Player Inventory: {inv_summary}",
         f"Active Quests & Objectives: {quest_summary}",
         f"Completed Quests: {completed_summary}",

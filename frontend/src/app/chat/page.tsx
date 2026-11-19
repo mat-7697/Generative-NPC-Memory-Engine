@@ -20,6 +20,7 @@ interface ChatMessage {
   timestamp: string;
   memoriesUsed?: any[];
   affinityChange?: number;
+  source?: string;
 }
 
 export default function ChatPage() {
@@ -32,6 +33,8 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
+  // True once the first streamed token arrives (hides the typing indicator).
+  const [streamStarted, setStreamStarted] = useState(false);
   const [loadingNpcs, setLoadingNpcs] = useState(true);
   const [latestMemoriesUsed, setLatestMemoriesUsed] = useState<any[]>([]);
   const [showMemoriesSidebar, setShowMemoriesSidebar] = useState(true);
@@ -132,26 +135,61 @@ export default function ChatPage() {
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     };
 
+    // Recent on-screen dialogue (minus system/error bubbles) gives the NPC short-term
+    // context even if long-term memory is offline.
+    const history = messages
+      .filter((m) => m.senderName !== 'System' && m.text.trim())
+      .slice(-10)
+      .map((m) => ({ role: m.sender === 'user' ? ('player' as const) : ('npc' as const), text: m.text.slice(0, 2000) }));
+
     setMessages((prev) => [...prev, userMsg]);
     setSending(true);
+    setStreamStarted(false);
+
+    const npcMsgId = Math.random().toString();
+    let started = false;
+    const patchNpcMsg = (patch: (m: ChatMessage) => ChatMessage) =>
+      setMessages((prev) => prev.map((m) => (m.id === npcMsgId ? patch(m) : m)));
 
     try {
-      const response: ChatResponse = await api.chat.send({
-        npc_id: selectedNpc.npc_id,
-        message: userText,
-      });
+      const response: ChatResponse = await api.chat.stream(
+        { npc_id: selectedNpc.npc_id, message: userText, history },
+        {
+          onMeta: (meta) => {
+            if (meta.memory_online === false) {
+              toastError('Long-term memory (Qdrant) is offline — this chat will not be remembered later.');
+            }
+          },
+          onDelta: (chunk) => {
+            if (!started) {
+              started = true;
+              setStreamStarted(true);
+              // First token: add the NPC bubble that the rest of the reply streams into.
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: npcMsgId,
+                  sender: 'npc',
+                  senderName: selectedNpc.name,
+                  text: chunk,
+                  timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                },
+              ]);
+            } else {
+              patchNpcMsg((m) => ({ ...m, text: m.text + chunk }));
+            }
+          },
+        }
+      );
 
-      const npcMsg: ChatMessage = {
-        id: Math.random().toString(),
-        sender: 'npc',
+      patchNpcMsg((m) => ({
+        ...m,
         senderName: response.npc_name || selectedNpc.name,
-        text: response.reply,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        text: response.reply || m.text,
         memoriesUsed: response.memories_used,
         affinityChange: response.affinity_change,
-      };
-
-      setMessages((prev) => [...prev, npcMsg]);
+        source: response.source,
+      }));
       if (response.memories_used && response.memories_used.length > 0) {
         setLatestMemoriesUsed(response.memories_used);
       }
@@ -194,6 +232,7 @@ export default function ChatPage() {
       setMessages((prev) => [...prev, errorMsg]);
     } finally {
       setSending(false);
+      setStreamStarted(false);
     }
   };
 
@@ -349,7 +388,21 @@ export default function ChatPage() {
                         <span className="font-semibold uppercase tracking-wider">
                           {msg.senderName}
                         </span>
-                        <span>{msg.timestamp}</span>
+                        <span className="flex items-center gap-1.5">
+                          {msg.source && (
+                            <span
+                              title={msg.source === 'mock' ? 'Gemini unavailable — offline fallback reply' : `Live reply from ${msg.source}`}
+                              className={`px-1.5 py-0.5 rounded font-mono normal-case ${
+                                msg.source === 'mock'
+                                  ? 'bg-amber-500/20 text-amber-300'
+                                  : 'bg-emerald-500/20 text-emerald-300'
+                              }`}
+                            >
+                              {msg.source === 'mock' ? 'offline' : '✦ gemini'}
+                            </span>
+                          )}
+                          {msg.timestamp}
+                        </span>
                       </div>
                       <p className="whitespace-pre-wrap">{msg.text}</p>
 
@@ -366,7 +419,7 @@ export default function ChatPage() {
               })}
 
               {/* Typing indicator */}
-              {sending && (
+              {sending && !streamStarted && (
                 <div className="flex items-center gap-3">
                   <div className="w-9 h-9 rounded-xl bg-indigo-950/60 border border-indigo-500/40 flex items-center justify-center text-sm text-cyan-300 shrink-0">
                     {selectedNpc ? getNPCAvatar(selectedNpc.name) : '🤖'}

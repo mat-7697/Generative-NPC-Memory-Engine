@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # Gemini LLM
     gemini_api_key: str = ""
     google_api_key: str = ""
-    gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_model: str = "gemini-3.1-flash-lite"
     llm_provider: str = "mock"  # 'gemini' or 'mock'
 
     # Embedding

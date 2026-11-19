@@ -1,110 +1,191 @@
 """LLM service supporting Google Gemini and contextual deterministic Mock providers."""
 
+import json
 import logging
 import random
 import re
+from typing import List, Optional
+
+import httpx
+
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Fast, generally-available models tried (in order) after the configured one when
+# Google reports the primary as busy (HTTP 429/503), slow, or unavailable.
+FALLBACK_GEMINI_MODELS = ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-flash-lite-latest")
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models"
 
-def _generate_gemini_response(
-    system_prompt: str, user_message: str, context: str = ""
-) -> str:
-    """Generate a response using the Google Gemini API (via google.generativeai or direct REST)."""
+
+def _gemini_api_key() -> str:
     settings = get_settings()
-    api_key = (settings.gemini_api_key or settings.google_api_key or "").strip()
+    key = (settings.gemini_api_key or settings.google_api_key or "").strip()
+    if not key or key.startswith("your-") or key.startswith("AIza-placeholder") or key == "mock-key":
+        return ""
+    return key
 
-    if not api_key or api_key.startswith("your-") or api_key.startswith("AIza-placeholder") or api_key == "mock-key":
-        logger.warning(
-            "Gemini API key is missing or is placeholder. Falling back to mock LLM provider."
-        )
-        return _generate_mock_response(system_prompt, user_message, context)
 
+def gemini_enabled() -> bool:
+    """True when the Gemini provider is selected and a real API key is configured."""
+    return get_settings().llm_provider.strip().lower() == "gemini" and bool(_gemini_api_key())
+
+
+def _gemini_models() -> list:
+    primary = get_settings().gemini_model.replace("models/", "").strip()
+    models = [primary] if primary else []
+    return models + [m for m in FALLBACK_GEMINI_MODELS if m not in models]
+
+
+def _history_contents(history: Optional[List[dict]], user_message: str) -> List[dict]:
+    """Turn recent dialogue ({role: player|npc, text}) plus the new message into Gemini
+    multi-turn `contents`, merging consecutive same-role lines and starting with the user."""
+    contents: List[dict] = []
+    for turn in history or []:
+        role = "model" if turn.get("role") == "npc" else "user"
+        text = (turn.get("text") or "").strip()
+        if not text or (not contents and role == "model"):
+            continue
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"][0]["text"] += "\n" + text
+        else:
+            contents.append({"role": role, "parts": [{"text": text}]})
+    if contents and contents[-1]["role"] == "user":
+        contents[-1]["parts"][0]["text"] += "\n" + user_message
+    else:
+        contents.append({"role": "user", "parts": [{"text": user_message}]})
+    return contents
+
+
+def _gemini_payload(
+    model_name: str, system_prompt: str, user_message: str, context: str,
+    history: Optional[List[dict]] = None,
+) -> dict:
     full_context = system_prompt
     if context:
-        full_context += f"\n\n--- RECALLED MEMORIES / CONTEXT ---\n{context}"
+        full_context += f"\n\n--- WHAT YOU KNOW RIGHT NOW ---\n{context}"
     # Short replies read better in the chat panel and come back much faster.
     full_context += (
-        "\n\nRESPONSE LENGTH: Reply in at most 3 short sentences (under 70 words). "
-        "At most one brief *action* in asterisks. No lists or headings."
+        "\n\nRESPONSE LENGTH: 2-4 sentences (under 90 words). At most one short *action* in "
+        "asterisks, and only when it adds something. No lists or headings."
     )
-
-    # 1. Attempt using official google.generativeai SDK if installed
-    try:
-        import google.generativeai as genai
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name=settings.gemini_model,
-            system_instruction=full_context,
-            generation_config={"temperature": 0.7, "max_output_tokens": 350},
-        )
-        response = model.generate_content(user_message)
-        if response and response.text:
-            return response.text.strip()
-    except ImportError:
-        pass
-    except Exception as exc:
-        logger.warning("google.generativeai SDK call failed: %s. Falling back to direct REST API.", exc)
-
-    # 2. Attempt using direct Gemini REST API via httpx (built-in, zero external SDK needed)
-    try:
-        import httpx
-    except ImportError:
-        logger.error("httpx is not installed. Falling back to mock provider.")
-        return _generate_mock_response(system_prompt, user_message, context)
-
-    # Primary model from settings, then a lightweight fallback if Google is overloaded
-    # (HTTP 429/503) or slow. Keeps live demos responsive.
-    primary = settings.gemini_model.replace("models/", "")
-    models_to_try = [primary] + [m for m in ("gemini-flash-lite-latest",) if m != primary]
-
-    payload_base = {
+    generation_config: dict = {"temperature": 0.9, "topP": 0.95, "maxOutputTokens": 512}
+    # Thinking tokens add seconds of latency and count against maxOutputTokens;
+    # NPC dialogue doesn't need them.
+    if model_name.startswith("gemini-2.5"):
+        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+    elif model_name.startswith("gemini-3"):
+        generation_config["thinkingConfig"] = {"thinkingLevel": "minimal"}
+    return {
         "system_instruction": {"parts": [{"text": full_context}]},
-        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "contents": _history_contents(history, user_message),
+        "generationConfig": generation_config,
     }
 
-    for model_name in models_to_try:
-        # Standard Google Generative Language REST v1beta endpoint.
-        # The key is sent in a header (not the URL) so it never appears in logs or tracebacks.
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-        generation_config = {"temperature": 0.7, "maxOutputTokens": 512}
-        # Gemini 2.5 Flash models "think" by default and those tokens count against
-        # maxOutputTokens, which can leave the reply empty. NPC dialogue doesn't need it.
-        if "2.5-flash" in model_name:
-            generation_config["thinkingConfig"] = {"thinkingBudget": 0}
-        payload = {**payload_base, "generationConfig": generation_config}
 
+def _extract_text(chunk: dict) -> str:
+    candidates = chunk.get("candidates") or []
+    if not candidates:
+        return ""
+    parts = candidates[0].get("content", {}).get("parts", []) or []
+    # Skip internal "thought" parts; only the visible reply text is returned.
+    return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+
+
+def _generate_gemini_response(
+    system_prompt: str, user_message: str, context: str = "", history: Optional[List[dict]] = None
+):
+    """Non-streaming Gemini call. Returns (reply_text, source) where source is the
+    model that answered, or "mock" if every Gemini attempt failed."""
+    api_key = _gemini_api_key()
+    if not api_key:
+        logger.warning("Gemini API key is missing or is a placeholder; using mock replies.")
+        return _generate_mock_response(system_prompt, user_message, context), "mock"
+
+    for model_name in _gemini_models():
+        # The key is sent in a header (not the URL) so it never appears in logs.
+        url = f"{GEMINI_API}/{model_name}:generateContent"
         try:
-            with httpx.Client(timeout=20.0) as client:
-                resp = client.post(url, json=payload, headers={"x-goog-api-key": api_key})
-        except httpx.TimeoutException:
-            logger.warning("Gemini (%s) timed out; trying next option.", model_name)
-            continue
+            with httpx.Client(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+                resp = client.post(
+                    url,
+                    json=_gemini_payload(model_name, system_prompt, user_message, context, history),
+                    headers={"x-goog-api-key": api_key},
+                )
         except Exception as exc:
-            logger.error("Gemini (%s) request failed: %s", model_name, exc)
+            logger.warning("Gemini (%s) request failed: %s; trying next model.", model_name, exc)
             continue
 
         if resp.status_code == 200:
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in parts).strip()
-                if text:
-                    logger.info("Gemini (%s) generated a live NPC reply.", model_name)
-                    return text
-            logger.warning("Gemini (%s) returned no text (finish reason: %s).", model_name,
-                           candidates[0].get("finishReason") if candidates else "no candidates")
-        elif resp.status_code in (429, 500, 503):
-            logger.warning("Gemini (%s) busy (HTTP %d); trying next option.", model_name, resp.status_code)
+            text = _extract_text(resp.json()).strip()
+            if text:
+                logger.info("Gemini (%s) generated a live NPC reply.", model_name)
+                return text, model_name
+            logger.warning("Gemini (%s) returned no text; trying next model.", model_name)
         else:
-            logger.error("Gemini (%s) API error (HTTP %d): %s", model_name, resp.status_code, resp.text[:500])
+            logger.warning("Gemini (%s) HTTP %d: %s", model_name, resp.status_code, resp.text[:300])
 
-    logger.error("All Gemini attempts failed. Falling back to mock provider.")
+    logger.error("All Gemini models failed. Falling back to mock provider.")
+    return _generate_mock_response(system_prompt, user_message, context), "mock"
 
-    return _generate_mock_response(system_prompt, user_message, context)
+
+def stream_response(
+    system_prompt: str, user_message: str, context: str = "", history: Optional[List[dict]] = None
+):
+    """Stream an NPC reply token-by-token.
+
+    Yields ("delta", text) pieces as they arrive, then one ("source", name) naming
+    the model that answered ("mock" if Gemini was unavailable). A model that fails
+    before producing any text is skipped and the next one is tried.
+    """
+    if not gemini_enabled():
+        yield "delta", _generate_mock_response(system_prompt, user_message, context)
+        yield "source", "mock"
+        return
+
+    api_key = _gemini_api_key()
+    for model_name in _gemini_models():
+        url = f"{GEMINI_API}/{model_name}:streamGenerateContent?alt=sse"
+        produced = False
+        try:
+            with httpx.Client(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+                with client.stream(
+                    "POST",
+                    url,
+                    json=_gemini_payload(model_name, system_prompt, user_message, context, history),
+                    headers={"x-goog-api-key": api_key},
+                ) as resp:
+                    if resp.status_code != 200:
+                        resp.read()
+                        logger.warning("Gemini stream (%s) HTTP %d: %s",
+                                       model_name, resp.status_code, resp.text[:300])
+                        continue
+                    for line in resp.iter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            chunk = json.loads(line[5:].strip())
+                        except ValueError:
+                            continue
+                        text = _extract_text(chunk)
+                        if text:
+                            produced = True
+                            yield "delta", text
+        except Exception as exc:
+            logger.warning("Gemini stream (%s) failed: %s", model_name, exc)
+            if not produced:
+                continue
+            # Part of the reply is already on screen; finish with what we have.
+
+        if produced:
+            logger.info("Gemini (%s) streamed a live NPC reply.", model_name)
+            yield "source", model_name
+            return
+        logger.warning("Gemini stream (%s) returned no text; trying next model.", model_name)
+
+    logger.error("All Gemini models failed while streaming. Falling back to mock provider.")
+    yield "delta", _generate_mock_response(system_prompt, user_message, context)
+    yield "source", "mock"
 
 
 def _detect_persona(text: str) -> str:
@@ -374,14 +455,15 @@ def _generate_mock_response(
     )
 
 
-def generate_response(
-    system_prompt: str, user_message: str, context: str = ""
-) -> str:
-    """Generate an LLM response choosing between Gemini and Mock providers."""
-    settings = get_settings()
-    provider = settings.llm_provider.strip().lower()
+def generate_response_with_source(
+    system_prompt: str, user_message: str, context: str = "", history: Optional[List[dict]] = None
+):
+    """Generate a reply and report where it came from: a Gemini model name or "mock"."""
+    if get_settings().llm_provider.strip().lower() == "gemini":
+        return _generate_gemini_response(system_prompt, user_message, context, history)
+    return _generate_mock_response(system_prompt, user_message, context), "mock"
 
-    if provider == "gemini":
-        return _generate_gemini_response(system_prompt, user_message, context)
-    else:
-        return _generate_mock_response(system_prompt, user_message, context)
+
+def generate_response(system_prompt: str, user_message: str, context: str = "") -> str:
+    """Generate an LLM response choosing between Gemini and Mock providers."""
+    return generate_response_with_source(system_prompt, user_message, context)[0]
