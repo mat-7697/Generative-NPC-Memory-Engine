@@ -6,6 +6,12 @@ This document presents the complete Entity-Relationship model for the **Generati
 
 ![ER Diagram](ER_DIAGRAM.png)
 
+### Chen Notation ER Diagram
+
+The same model drawn in classic Chen notation: rectangles are entities, diamonds are relationships, ovals are attributes (underlined = key attribute), and `INVENTORY_TRANSACTION` is a weak entity (double rectangle) identified through the `LOGS` identifying relationship (double diamond) with a partial key `transaction_id` (dashed oval). Cardinalities are marked on each relationship edge (1, M, N).
+
+![Chen Notation ER Diagram](ER_DIAGRAM_CHEN.png)
+
 ---
 
 ## 1. Complete Mermaid ER Diagram
