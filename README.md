@@ -55,6 +55,83 @@ flowchart TD
 
 ---
 
+## Database Design
+
+### Entity-Relationship (ER) Diagram
+
+![ER Diagram](docs/ER_DIAGRAM.png)
+
+```mermaid
+erDiagram
+    PLAYERS ||--o{ PLAYER_INVENTORY : "holds"
+    PLAYERS ||--o{ PLAYER_QUESTS : "undertakes"
+    PLAYERS ||--o{ INVENTORY_TRANSACTIONS : "executes"
+    PLAYERS ||--o{ NPC_RELATIONSHIPS : "develops"
+
+    NPCS ||--o{ PLAYER_QUESTS : "assigns"
+    NPCS ||--o{ NPC_RELATIONSHIPS : "maintains"
+
+    ITEMS ||--o{ PLAYER_INVENTORY : "stocked_in"
+    ITEMS ||--o{ INVENTORY_TRANSACTIONS : "transacted_in"
+    ITEMS |o--o{ QUESTS : "rewarded_by"
+
+    QUESTS ||--o{ PLAYER_QUESTS : "tracked_in"
+    QUESTS ||--o{ QUEST_PREREQUISITES : "requires"
+    QUESTS ||--o{ QUEST_PREREQUISITES : "is_prerequisite_for"
+
+    AUDIT_LOG {
+        int log_id PK
+        string table_name
+        string operation
+        int row_id
+        jsonb old_data
+        jsonb new_data
+        string changed_by
+        timestamptz changed_at
+    }
+```
+
+> For the classic entity-relationship view, see the [Chen Notation ER Diagram](docs/ER_DIAGRAM_CHEN.png).
+
+#### Cardinalities & Relationships
+- **PLAYERS — PLAYER_INVENTORY (1 : N)**: A player can hold multiple inventory items; each record belongs to one player.
+- **PLAYERS — PLAYER_QUESTS (1 : N)**: A player can track multiple quests simultaneously.
+- **NPCS — NPC_RELATIONSHIPS (1 : N)**: An NPC maintains separate affinity scores per player.
+- **ITEMS — PLAYER_INVENTORY (1 : N)**: An item can be held across multiple player inventories.
+- **QUESTS — QUEST_PREREQUISITES (M : N recursive)**: Quests form a directed acyclic graph (DAG) where quests can require multiple prerequisites and unlock downstream quests.
+- **PLAYERS — INVENTORY_TRANSACTIONS (1 : N)**: Append-only ledger recording every purchase, sale, and quest reward.
+
+---
+
+### Relational Model & Schema
+
+The PostgreSQL relational model comprises 10 core tables designed in **Third Normal Form (3NF)**:
+
+| Relation | Primary Key | Foreign Keys | Key Constraints |
+|---|---|---|---|
+| `players` | `player_id` | — | `UNIQUE(username)`, `UNIQUE(email)`, `gold >= 0`, `level > 0`, `xp >= 0` |
+| `npcs` | `npc_id` | — | `UNIQUE(name)`, `personality_traits` (JSONB) |
+| `items` | `item_id` | — | `UNIQUE(name)`, `base_price > 0`, `stock >= -1`, Full-Text Search (GIN `search_vector`) |
+| `quests` | `quest_id` | `reward_item_id -> items(item_id)` | `reward_gold >= 0`, `min_level > 0`, Full-Text Search (GIN `search_vector`) |
+| `player_inventory` | `inventory_id` | `player_id -> players(player_id)`, `item_id -> items(item_id)` | `UNIQUE(player_id, item_id)`, `quantity >= 0` |
+| `player_quests` | `player_quest_id` | `player_id -> players(player_id)`, `quest_id -> quests(quest_id)` | `UNIQUE(player_id, quest_id)`, `status IN ('available', 'active', 'completed', 'failed')` |
+| `quest_prerequisites` | `prerequisite_id` | `quest_id -> quests(quest_id)`, `required_quest_id -> quests(quest_id)` | `UNIQUE(quest_id, required_quest_id)`, `CHECK (quest_id <> required_quest_id)` |
+| `inventory_transactions` | `transaction_id` | `player_id -> players(player_id)`, `item_id -> items(item_id)` | `quantity > 0`, `transaction_type IN ('buy', 'sell', 'quest_reward', ...)` |
+| `npc_relationships` | `relationship_id` | `player_id -> players(player_id)`, `npc_id -> npcs(npc_id)` | `UNIQUE(player_id, npc_id)`, `affinity_score BETWEEN -100.00 AND 100.00` |
+| `audit_log` | `log_id` | — | `operation IN ('INSERT', 'UPDATE', 'DELETE')`, `old_data` (JSONB), `new_data` (JSONB) |
+
+#### Referential Integrity & Cascade Rules
+- **Account Cleanup (`ON DELETE CASCADE`)**: Deleting a player automatically cascades to `player_inventory`, `player_quests`, `inventory_transactions`, and `npc_relationships`.
+- **Integrity Protection (`ON DELETE RESTRICT`)**: Items referenced in active inventories or quest prerequisites cannot be accidentally deleted.
+- **Graceful Nullification (`ON DELETE SET NULL`)**: Removing an item clears the quest bonus item (`reward_item_id`) without invalidating quest progression.
+
+#### Normalization (3NF)
+- **1NF**: All columns contain atomic, scalar values (with structured `JSONB` for flexible personality traits). Every table has an explicit primary key (`GENERATED ALWAYS AS IDENTITY`).
+- **2NF**: In composite-key relations (`player_inventory`, `player_quests`, `npc_relationships`), all non-key attributes (`quantity`, `status`, `affinity_score`) depend strictly on the whole candidate key, eliminating partial dependencies.
+- **3NF**: Zero transitive dependencies exist. For example, item prices and descriptions are stored only in `items`, never duplicated in `player_inventory` or `inventory_transactions`.
+
+---
+
 ## Features
 
 ### Dialogue & Memory Pipeline
